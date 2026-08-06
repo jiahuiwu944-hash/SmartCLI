@@ -38,7 +38,7 @@ SmartCLI 基于开源项目 [PaiCLI-Python](https://github.com/itwanger/PaiCLI-P
 ## 快速开始
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/SmartCLI.git
+git clone https://github.com/jiahuiwu944-hash/SmartCLI.git
 cd SmartCLI
 uv sync --extra dev
 uv run smartcli --help
