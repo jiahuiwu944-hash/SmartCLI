@@ -1,10 +1,10 @@
 # SmartCLI
 
-SmartCLI 是一个运行在终端里的 AI 编程助手，面向真实项目开发场景：读写文件、搜索代码、执行命令、联网检索、调用 MCP 工具、保存记忆、生成快照、恢复现场，并通过 Runtime API 对外提供线程、turn、事件和后台任务能力。
+SmartCLI 是一个为了深入学习和探索 AI Agent 核心机制而开发的终端智能编程助手，面向真实项目开发场景，支持读写文件、搜索代码、执行命令、联网检索、调用 MCP 工具、保存记忆、生成快照与恢复现场，并通过 Runtime API 对外提供线程、turn、事件和后台任务能力。
 
 ## 来源与致谢
 
-SmartCLI 基于开源项目 [PaiCLI-Python](https://github.com/itwanger/PaiCLI-Python) 学习与二次开发，保留原项目 MIT License 与版权声明。项目的公开产品名和主命令已调整为 SmartCLI；内部 Python 包名、`PAICLI_*` 环境变量和 `.paicli` 配置目录暂时保留，以兼容原有代码与用户数据。
+项目围绕 ReAct 推理、任务规划、Multi-Agent 协作、MCP 工具扩展、Memory、RAG 与安全执行等能力展开，旨在通过完整的工程实践理解 AI Agent 从模型调用到自主任务执行的核心链路。
 
 它不是一个空壳 Demo：核心路径有自动化测试覆盖，也经过本地 smoke 和真实终端运行验证。
 
