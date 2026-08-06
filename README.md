@@ -359,14 +359,6 @@ uv run smartcli doctor --cwd .
 uv run smartcli --plain -p hello
 ```
 
-## 和 Java / TypeScript 版本的关系
-
-Python 版覆盖了 Java / TypeScript 版本里公开、开放协议相关的主要 Agent CLI 能力，包括 CLI、REPL、ReAct、Plan-and-Execute、Multi-Agent、Skill、SDK、工具调用、MCP、Runtime API、记忆、快照、联网工具和图片输入。
-
-Java 版本里还有一个私有的微信 iLink 通道。Python 仓库没有内置这个私有通道，因为它依赖账号、扫码登录和协议凭证，不应该用假实现冒充。
-
-更详细的实现对齐情况见 [docs/parity.md](docs/parity.md)。
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
