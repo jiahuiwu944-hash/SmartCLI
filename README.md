@@ -6,6 +6,8 @@ SmartCLI 是一个为了深入学习和探索 AI Agent 核心机制而开发的�
 
 项目围绕 ReAct 推理、任务规划、Multi-Agent 协作、MCP 工具扩展、Memory、RAG 与安全执行等能力展开，旨在通过完整的工程实践理解 AI Agent 从模型调用到自主任务执行的核心链路。
 
+![SmartCLI 终端运行效果](docs/images/smartcli-terminal-demo.png)
+
 它不是一个空壳 Demo：核心路径有自动化测试覆盖，也经过本地 smoke 和真实终端运行验证。
 
 ## 功能特性
