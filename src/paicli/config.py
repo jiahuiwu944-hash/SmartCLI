@@ -25,6 +25,21 @@ class LlmConfig:
 
 
 @dataclass(slots=True)
+class AgentConfig:
+    # These are safety budgets, not a fixed execution plan. A run normally ends
+    # as soon as the model returns a final response without requesting tools.
+    max_turns: int = 20
+    max_total_tokens: int = 100_000
+    max_runtime_seconds: float = 900.0
+    repeated_tool_call_limit: int = 3
+    consecutive_tool_error_limit: int = 3
+    stop_hook_enabled: bool = True
+    stop_hook_max_retries: int = 2
+    budget_extension_turns: int = 20
+    budget_extension_tokens: int = 100_000
+
+
+@dataclass(slots=True)
 class ToolsConfig:
     enabled: list[str] = field(default_factory=list)
     disabled: list[str] = field(default_factory=list)
@@ -90,6 +105,7 @@ class FeatureConfig:
 @dataclass(slots=True)
 class PaiCliConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
+    agent: AgentConfig = field(default_factory=AgentConfig)
     render_mode: str = "inline"
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
@@ -180,6 +196,7 @@ def _read_env(path: Path) -> dict[str, str]:
 def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, Any]:
     result = deepcopy(data)
     llm = result.setdefault("llm", {})
+    agent = result.setdefault("agent", {})
     features = result.setdefault("features", {})
     policy = result.setdefault("policy", {})
 
@@ -196,6 +213,23 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 llm[config_key] = caster(raw)
+
+    agent_mappings: list[tuple[str, str, Any]] = [
+        ("PAICLI_AGENT_MAX_TURNS", "max_turns", int),
+        ("PAICLI_AGENT_TOKEN_BUDGET", "max_total_tokens", int),
+        ("PAICLI_AGENT_MAX_SECONDS", "max_runtime_seconds", float),
+        ("PAICLI_AGENT_REPEAT_LIMIT", "repeated_tool_call_limit", int),
+        ("PAICLI_AGENT_ERROR_LIMIT", "consecutive_tool_error_limit", int),
+        ("PAICLI_STOP_HOOK", "stop_hook_enabled", _parse_bool),
+        ("PAICLI_STOP_HOOK_RETRIES", "stop_hook_max_retries", int),
+        ("PAICLI_AGENT_EXTENSION_TURNS", "budget_extension_turns", int),
+        ("PAICLI_AGENT_EXTENSION_TOKENS", "budget_extension_tokens", int),
+    ]
+    for env_key, config_key, caster in agent_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                agent[config_key] = caster(raw)
 
     provider = str(llm.get("provider") or "").lower()
     if not llm.get("api_key"):
@@ -266,6 +300,7 @@ def _config_to_dict(config: PaiCliConfig) -> dict[str, Any]:
 def _dict_to_config(data: dict[str, Any]) -> PaiCliConfig:
     return PaiCliConfig(
         llm=LlmConfig(**data.get("llm", {})),
+        agent=AgentConfig(**data.get("agent", {})),
         render_mode=data.get("render_mode", "inline"),
         tools=ToolsConfig(**data.get("tools", {})),
         mcp=McpConfig(**data.get("mcp", {})),
@@ -278,3 +313,12 @@ def _dict_to_config(data: dict[str, Any]) -> PaiCliConfig:
 
 def _expand_home(path: str) -> str:
     return str(Path(path).expanduser())
+
+
+def _parse_bool(value: Any) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean: {value}")

@@ -135,6 +135,7 @@ class SubAgent:
                 approval_callback=self.approval_callback,
                 skill_context_buffer=self.skill_context_buffer,
                 max_turns=8,
+                stop_hook_enabled=False,
             ):
                 if event.get("type") == "text_delta":
                     text += str(event.get("text") or "")
@@ -142,6 +143,8 @@ class SubAgent:
                     tool_results.append(str(event.get("result") or ""))
                 elif event.get("type") == "done":
                     self.history = list(event.get("messages") or [])
+                elif event.get("type") == "run_stopped":
+                    raise RuntimeError(str(event.get("message") or "Agent run stopped"))
                 elif event.get("type") == "error":
                     raise event["error"]
         except Exception as exc:  # noqa: BLE001

@@ -27,3 +27,5 @@ class QueryResult:
     text: str
     total_tokens: int
     turns: int
+    termination_reason: str = "completed"
+    completed: bool = True

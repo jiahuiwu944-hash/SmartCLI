@@ -89,6 +89,7 @@ async def start_repl(cwd: str, config: PaiCliConfig) -> None:
         cwd=cwd,
         config=config,
         approval_callback=lambda request: _approval_prompt(request, console, config),
+        continuation_callback=lambda request: _continuation_prompt(request, console),
     )
 
     history_path = Path.home() / ".paicli" / "history" / "prompt_history.txt"
@@ -385,6 +386,31 @@ def _approval_prompt(request: dict[str, Any], console: Console, config: PaiCliCo
     if answer == "s":
         return "skip"
     return "deny"
+
+
+def _continuation_prompt(request: dict[str, Any], console: Console) -> dict[str, Any]:
+    reason = str(request.get("reason") or "budget")
+    extra_turns = int(request.get("suggested_additional_turns") or 0)
+    extra_tokens = int(request.get("suggested_additional_tokens") or 0)
+    additions = []
+    if extra_turns:
+        additions.append(f"{extra_turns} turns")
+    if extra_tokens:
+        additions.append(f"{extra_tokens} tokens")
+    console.print(
+        f"[yellow]Execution budget reached[/yellow] ({reason}). "
+        "Conversation and tool context are preserved."
+    )
+    answer = Prompt.ask(
+        f"Add {' and '.join(additions) or 'more budget'} and continue?",
+        choices=["y", "n"],
+        default="y",
+    )
+    return {
+        "continue": answer == "y",
+        "additional_turns": extra_turns,
+        "additional_tokens": extra_tokens,
+    }
 
 
 def _count_mcp_servers(manager: Any) -> int:

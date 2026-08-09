@@ -20,6 +20,29 @@ class PlainRenderer:
             marker = "error" if event.get("is_error") else "result"
             sys.stdout.write(f"[tool:{marker}] {event.get('name')}: {event.get('result')}\n")
             sys.stdout.flush()
+        elif event_type == "run_stopped":
+            reason = str(event.get("reason") or "safety_limit")
+            message = str(event.get("message") or "Agent run stopped")
+            sys.stdout.write(f"\n[stopped:{reason}] {message}\n")
+            sys.stdout.flush()
+        elif event_type == "stop_hook_review":
+            status = "approved" if event.get("approved") else "revision-required"
+            sys.stdout.write(f"\n[stop-hook:{status}] {event.get('feedback') or ''}\n")
+            sys.stdout.flush()
+        elif event_type == "model_redirected":
+            sys.stdout.write(f"\n[redirected:{event.get('reason')}] {event.get('message') or ''}\n")
+            sys.stdout.flush()
+        elif event_type == "budget_extended":
+            sys.stdout.write(
+                "\n[budget-extended] "
+                f"+{event.get('additional_turns') or 0} turns, "
+                f"+{event.get('additional_tokens') or 0} tokens; context preserved.\n"
+            )
+            sys.stdout.flush()
+        elif event_type == "error":
+            message = str(event.get("message") or event.get("error") or "Unknown error")
+            sys.stdout.write(f"\n[error:context-preserved] {message}\n")
+            sys.stdout.flush()
 
     def newline(self) -> None:
         sys.stdout.write("\n")

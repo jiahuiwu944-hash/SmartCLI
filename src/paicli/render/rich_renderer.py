@@ -114,10 +114,34 @@ class RichRenderer:
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
             self._print_tool_result(event)
+        elif event_type == "stop_hook_review":
+            self._flush_thinking()
+            self._flush_markdown(title="Assistant Output")
+            self._print_stop_hook_review(event)
+        elif event_type == "model_redirected":
+            self._flush_thinking()
+            self._flush_markdown(title="Assistant Output")
+            self._print_model_redirected(event)
+        elif event_type == "budget_extension_requested":
+            self._flush_thinking()
+            self._flush_markdown(title="Assistant Output")
+        elif event_type == "budget_extended":
+            self._print_budget_extended(event)
+        elif event_type == "run_stopped":
+            self._flush_thinking()
+            self._flush_markdown(title="Assistant Output")
+            self._print_run_stopped(event)
         elif event_type == "error":
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
-            self.console.print(f"[red]Error:[/red] {event.get('error')}")
+            message = str(event.get("message") or event.get("error") or "Unknown error")
+            self.console.print(
+                _output_panel(
+                    message,
+                    title=Text("Connection Error · context preserved", style="bold #ff4d5a"),
+                    border_style="#ff4d5a",
+                )
+            )
         elif event_type == "done":
             self._flush_thinking()
             self._flush_markdown(title="Final Output")
@@ -258,6 +282,53 @@ class RichRenderer:
                 title=Text(f"Tool Result · {name} · {status}", style=title_style),
                 border_style=border_style,
             )
+        )
+
+    def _print_run_stopped(self, event: dict[str, Any]) -> None:
+        reason = str(event.get("reason") or "safety_limit")
+        message = str(event.get("message") or "Agent run stopped")
+        self.console.print(
+            _output_panel(
+                message,
+                title=Text(f"Agent Stopped · {reason}", style="bold #fb923c"),
+                border_style="#fb923c",
+            )
+        )
+
+    def _print_stop_hook_review(self, event: dict[str, Any]) -> None:
+        approved = bool(event.get("approved"))
+        feedback = str(event.get("feedback") or "Answer verified.")
+        status = "approved" if approved else "revision required"
+        color = "#22c55e" if approved else "#fb923c"
+        self.console.print(
+            _output_panel(
+                feedback,
+                title=Text(f"Stop Hook 路 {status}", style=f"bold {color}"),
+                border_style=color,
+            )
+        )
+
+    def _print_model_redirected(self, event: dict[str, Any]) -> None:
+        reason = str(event.get("reason") or "correction")
+        message = str(event.get("message") or "The model was asked to revise its approach.")
+        self.console.print(
+            _output_panel(
+                message,
+                title=Text(f"Agent Correction 路 {reason}", style="bold #c084fc"),
+                border_style="#6d28d9",
+            )
+        )
+
+    def _print_budget_extended(self, event: dict[str, Any]) -> None:
+        turns = int(event.get("additional_turns") or 0)
+        tokens = int(event.get("additional_tokens") or 0)
+        additions = []
+        if turns:
+            additions.append(f"+{turns} turns")
+        if tokens:
+            additions.append(f"+{tokens} tokens")
+        self.console.print(
+            f"[green]Budget extended:[/green] {', '.join(additions)}; context preserved."
         )
 
     def _record_run_summary(self, event: dict[str, Any]) -> None:

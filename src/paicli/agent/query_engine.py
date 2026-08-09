@@ -21,12 +21,16 @@ class QueryEngine:
         config: PaiCliConfig,
         cwd: str,
         approval_callback=None,
+        continuation_callback=None,
+        stop_hook_callback=None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
         self.config = config
         self.cwd = cwd
         self.approval_callback = approval_callback
+        self.continuation_callback = continuation_callback
+        self.stop_hook_callback = stop_hook_callback
         self.system_prompt = PromptAssembler(
             config=config,
             cwd=cwd,
@@ -43,6 +47,8 @@ class QueryEngine:
             cwd=self.cwd,
             config=self.config,
             approval_callback=self.approval_callback,
+            continuation_callback=self.continuation_callback,
+            stop_hook_callback=self.stop_hook_callback,
         )
         agent.history = list(history or [])
         async for event in agent.run(message):
@@ -78,6 +84,8 @@ class QueryEngine:
         text = ""
         tokens = 0
         turns = 0
+        termination_reason = "completed"
+        completed = True
         async for event in self.ask(message, history):
             if event.get("type") == "text_delta":
                 text += str(event.get("text") or "")
@@ -86,7 +94,15 @@ class QueryEngine:
             elif event.get("type") == "done":
                 tokens = int(event.get("total_tokens") or 0)
                 turns = int(event.get("total_turns") or 0)
-        return QueryResult(text=text, total_tokens=tokens, turns=turns)
+                termination_reason = str(event.get("termination_reason") or "completed")
+                completed = bool(event.get("completed", termination_reason == "completed"))
+        return QueryResult(
+            text=text,
+            total_tokens=tokens,
+            turns=turns,
+            termination_reason=termination_reason,
+            completed=completed,
+        )
 
     async def plan_complete_async(self, message: str) -> QueryResult:
         return await self._complete_from_events(self.plan(message))

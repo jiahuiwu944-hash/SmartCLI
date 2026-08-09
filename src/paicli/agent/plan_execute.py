@@ -160,6 +160,7 @@ class PlanExecuteAgent:
                 approval_callback=self.approval_callback,
                 skill_context_buffer=self.skill_context_buffer,
                 max_turns=self.max_task_turns,
+                stop_hook_enabled=False,
             ):
                 if event.get("type") == "text_delta":
                     text += str(event.get("text") or "")
@@ -173,6 +174,8 @@ class PlanExecuteAgent:
                     tokens += int(usage.get("output_tokens") or 0)
                 elif event.get("type") == "done":
                     turns += int(event.get("total_turns") or 0)
+                elif event.get("type") == "run_stopped":
+                    raise RuntimeError(str(event.get("message") or "Agent run stopped"))
                 elif event.get("type") == "error":
                     raise event["error"]
             result_text = text.strip() or "\n".join(tool_results).strip()

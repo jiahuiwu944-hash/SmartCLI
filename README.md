@@ -22,7 +22,7 @@ SmartCLI 是一个为了深入学习和探索 AI Agent 核心机制而开发的�
 - 单次 prompt 模式，适合脚本、管道和自动化调用
 - OpenAI-compatible 流式 LLM 客户端，默认面向 DeepSeek 配置
 - 支持 `DEEPSEEK_API_KEY` 等 provider-specific API Key
-- ReAct 工具调用循环，支持 thinking、tool call、tool result、final output 和 usage 事件
+- ReAct 动态执行循环：任务完成时自然结束，并通过轮次、Token、运行时间、重复调用和连续错误预算防止失控
 - Plan-and-Execute 模式，使用独立 Planner 生成 DAG，并按依赖批次执行可并行任务
 - Multi-Agent 协作模式，包含 Planner、Worker、Reviewer、依赖调度、并行 worker 和 review 重试
 - 内置文件、Shell、grep、glob、记忆、网页搜索、网页抓取、代码搜索等工具
@@ -103,6 +103,26 @@ PAICLI_API_KEY=your_key_here
 - `GLM_API_KEY`
 - `STEP_API_KEY`
 - `KIMI_API_KEY`
+
+### Stop Hook、循环纠偏与可续跑预算
+
+模型准备结束任务时，SmartCLI 会调用 Stop Hook 审查答案是否完成目标、是否具备工具或测试证据，并在 LLM 审查前确定性拦截“工具被跳过却声称全部完成”等矛盾；审查不通过时，反馈会写回当前上下文并驱动 Agent 继续修正。检测到连续相同的工具和参数时不会立即终止，而是跳过重复执行并要求模型更换参数、工具或方案。
+
+达到轮次或总 Token 上限后，交互终端会询问是否追加预算。用户同意后沿用完整消息与工具上下文继续执行；拒绝时上下文仍保存在当前 Agent 会话中，可通过后续消息继续。
+
+模型服务连接失败、超时或返回 HTTP 错误时，终端仅显示可操作的错误提示，不展开内部堆栈；当前消息和已有工具上下文会保留，连接恢复后可直接输入“继续”。
+
+```dotenv
+PAICLI_AGENT_MAX_TURNS=20
+PAICLI_AGENT_TOKEN_BUDGET=100000
+PAICLI_AGENT_MAX_SECONDS=900
+PAICLI_AGENT_REPEAT_LIMIT=3
+PAICLI_AGENT_ERROR_LIMIT=3
+PAICLI_STOP_HOOK=true
+PAICLI_STOP_HOOK_RETRIES=2
+PAICLI_AGENT_EXTENSION_TURNS=20
+PAICLI_AGENT_EXTENSION_TOKENS=100000
+```
 
 通过命令行临时覆盖 provider 和 model：
 

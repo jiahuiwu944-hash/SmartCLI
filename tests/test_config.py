@@ -40,3 +40,28 @@ def test_provider_specific_api_key(tmp_path, monkeypatch):
     config = load_config(project_root=tmp_path)
 
     assert config.llm.api_key == "deepseek-key"
+
+
+def test_agent_safety_budgets_can_be_configured_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PAICLI_AGENT_MAX_TURNS", "30")
+    monkeypatch.setenv("PAICLI_AGENT_TOKEN_BUDGET", "120000")
+    monkeypatch.setenv("PAICLI_AGENT_MAX_SECONDS", "600")
+    monkeypatch.setenv("PAICLI_AGENT_REPEAT_LIMIT", "4")
+    monkeypatch.setenv("PAICLI_AGENT_ERROR_LIMIT", "5")
+    monkeypatch.setenv("PAICLI_STOP_HOOK", "false")
+    monkeypatch.setenv("PAICLI_STOP_HOOK_RETRIES", "4")
+    monkeypatch.setenv("PAICLI_AGENT_EXTENSION_TURNS", "25")
+    monkeypatch.setenv("PAICLI_AGENT_EXTENSION_TOKENS", "150000")
+
+    config = load_config(project_root=tmp_path)
+
+    assert config.agent.max_turns == 30
+    assert config.agent.max_total_tokens == 120000
+    assert config.agent.max_runtime_seconds == 600
+    assert config.agent.repeated_tool_call_limit == 4
+    assert config.agent.consecutive_tool_error_limit == 5
+    assert config.agent.stop_hook_enabled is False
+    assert config.agent.stop_hook_max_retries == 4
+    assert config.agent.budget_extension_turns == 25
+    assert config.agent.budget_extension_tokens == 150000

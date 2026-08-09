@@ -188,3 +188,80 @@ def test_missing_usage_keeps_toolbar_tokens_unavailable():
     assert ("class:toolbar.model", "deepseek-v4-flash") in toolbar
     assert ("class:toolbar.ctx.bar", "░░░░░░░░░░░░") in toolbar
     assert ("class:toolbar.ctx.value", "0%") in toolbar
+
+
+def test_run_stopped_renders_the_guard_reason():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console)
+
+    renderer.handle(
+        {
+            "type": "run_stopped",
+            "reason": "repeated_tool_call",
+            "message": "Repeated tool call detected.",
+        }
+    )
+
+    output = stream.getvalue()
+    assert "Agent Stopped" in output
+    assert "repeated_tool_call" in output
+    assert "Repeated tool call detected." in output
+
+
+def test_stop_hook_and_budget_continuation_are_rendered():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console)
+
+    renderer.handle(
+        {
+            "type": "stop_hook_review",
+            "approved": False,
+            "feedback": "Run tests before stopping.",
+        }
+    )
+    renderer.handle(
+        {
+            "type": "model_redirected",
+            "reason": "repeated_tool_call",
+            "message": "Change parameters or approach.",
+        }
+    )
+    renderer.handle(
+        {
+            "type": "budget_extended",
+            "additional_turns": 20,
+            "additional_tokens": 100000,
+        }
+    )
+
+    output = stream.getvalue()
+    assert "Stop Hook" in output
+    assert "revision required" in output
+    assert "Run tests before stopping." in output
+    assert "Agent Correction" in output
+    assert "Budget extended" in output
+    assert "context preserved" in output
+
+
+def test_connection_error_is_rendered_without_a_traceback():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console)
+
+    renderer.handle(
+        {
+            "type": "error",
+            "error": RuntimeError("raw internal error"),
+            "message": "无法连接模型服务。当前上下文已保留。",
+            "context_preserved": True,
+        }
+    )
+
+    output = stream.getvalue()
+    assert "Connection Error" in output
+    assert "context preserved" in output
+    assert "无法连接模型服务" in output
+    assert "Traceback" not in output
+    assert "raw internal error" not in output

@@ -24,7 +24,9 @@ class Agent:
         cwd: str,
         config: PaiCliConfig,
         approval_callback=None,
-        max_turns: int = 20,
+        continuation_callback=None,
+        stop_hook_callback=None,
+        max_turns: int | None = None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -32,7 +34,9 @@ class Agent:
         self.cwd = cwd
         self.config = config
         self.approval_callback = approval_callback
-        self.max_turns = max_turns
+        self.continuation_callback = continuation_callback
+        self.stop_hook_callback = stop_hook_callback
+        self.max_turns = max_turns if max_turns is not None else config.agent.max_turns
         self.history: list[Message] = []
         self.skill_context_buffer = SkillContextBuffer()
 
@@ -50,10 +54,12 @@ class Agent:
                 cwd=self.cwd,
                 config=self.config,
                 approval_callback=self.approval_callback,
+                continuation_callback=self.continuation_callback,
+                stop_hook_callback=self.stop_hook_callback,
                 skill_context_buffer=self.skill_context_buffer,
                 max_turns=self.max_turns,
             ):
-                if event.get("type") == "done":
+                if event.get("type") in {"done", "error"} and event.get("messages"):
                     self.history = list(event.get("messages") or [])
                 yield event
         finally:
@@ -64,6 +70,8 @@ class Agent:
         text = ""
         tokens = 0
         turns = 0
+        termination_reason = "completed"
+        completed = True
         async for event in self.run(message):
             if event.get("type") == "text_delta":
                 text += str(event.get("text") or "")
@@ -72,7 +80,15 @@ class Agent:
             elif event.get("type") == "done":
                 tokens = int(event.get("total_tokens") or 0)
                 turns = int(event.get("total_turns") or 0)
-        return QueryResult(text=text, total_tokens=tokens, turns=turns)
+                termination_reason = str(event.get("termination_reason") or "completed")
+                completed = bool(event.get("completed", termination_reason == "completed"))
+        return QueryResult(
+            text=text,
+            total_tokens=tokens,
+            turns=turns,
+            termination_reason=termination_reason,
+            completed=completed,
+        )
 
     def clear_history(self) -> None:
         self.history = []
