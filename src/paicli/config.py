@@ -22,6 +22,8 @@ class LlmConfig:
     max_tokens: int = 8192
     temperature: float = 0.7
     timeout: float = 120.0
+    max_retries: int = 2
+    retry_base_delay: float = 0.5
 
 
 @dataclass(slots=True)
@@ -207,6 +209,8 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("PAICLI_BASE_URL", "base_url", str),
         ("PAICLI_MAX_TOKENS", "max_tokens", int),
         ("PAICLI_TEMPERATURE", "temperature", float),
+        ("PAICLI_LLM_MAX_RETRIES", "max_retries", int),
+        ("PAICLI_LLM_RETRY_BASE_DELAY", "retry_base_delay", float),
     ]
     for env_key, config_key, caster in mappings:
         raw = env.get(env_key)

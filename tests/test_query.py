@@ -68,6 +68,62 @@ def test_query_engine_executes_tool_and_replays_result(tmp_path, monkeypatch):
     assert result.termination_reason == "completed"
 
 
+class ToolFailureObservationClient:
+    model_name = "fake-model"
+    provider_name = "fake-provider"
+    max_context_window = 1000
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        if "Stop Hook reviewer" in system_prompt:
+            yield {"type": "text_delta", "text": '{"approved": true, "feedback": ""}'}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+            return
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "type": "tool_call_delta",
+                "tool_call": {
+                    "index": 0,
+                    "id": "missing_call",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"missing.txt"}',
+                    },
+                },
+            }
+            yield {"type": "message_end", "stop_reason": "tool_use"}
+            return
+
+        tool_messages = [message for message in messages if message.role == "tool"]
+        assert tool_messages
+        assert 'Tool "read_file" execution error' in tool_messages[-1].content
+        yield {"type": "text_delta", "text": "changed approach after observing the failure"}
+        yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+def test_tool_business_failure_is_returned_to_next_react_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = load_config(project_root=tmp_path)
+    registry = ToolRegistry()
+    registry.register_all(get_builtin_tools())
+    engine = QueryEngine(
+        llm_client=ToolFailureObservationClient(),
+        tool_registry=registry,
+        config=config,
+        cwd=str(tmp_path),
+    )
+
+    events = asyncio.run(_collect_events(engine))
+
+    result = next(event for event in events if event["type"] == "tool_result")
+    done = next(event for event in events if event["type"] == "done")
+    assert result["is_error"] is True
+    assert done["completed"] is True
+
+
 class LoopingToolClient:
     model_name = "fake-model"
     provider_name = "fake-provider"

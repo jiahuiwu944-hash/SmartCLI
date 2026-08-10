@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -19,6 +22,8 @@ class OpenAICompatibleClient:
     max_tokens: int = 8192
     temperature: float = 0.7
     timeout: float = 120.0
+    max_retries: int = 2
+    retry_base_delay: float = 0.5
     max_context_window: int = 128_000
     prompt_cache: bool = False
 
@@ -70,20 +75,49 @@ class OpenAICompatibleClient:
         url = self.base_url.rstrip("/") + "/chat/completions"
 
         yield {"type": "message_start", "model": self.model}
-        async with (
-            httpx.AsyncClient(timeout=self.timeout, http2=False) as client,
-            client.stream("POST", url, headers=headers, json=payload) as response,
-        ):
-            response.raise_for_status()
-            async for event in _iter_sse(response):
-                if event == "[DONE]":
-                    break
+        retry_limit = max(0, int(self.max_retries))
+        async with httpx.AsyncClient(timeout=self.timeout, http2=False) as client:
+            for attempt in range(retry_limit + 1):
+                streamed_model_event = False
                 try:
-                    chunk = json.loads(event)
-                except json.JSONDecodeError:
-                    continue
-                async for parsed in self._parse_chunk(chunk):
-                    yield parsed
+                    async with client.stream(
+                        "POST",
+                        url,
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        response.raise_for_status()
+                        async for event in _iter_sse(response):
+                            if event == "[DONE]":
+                                return
+                            try:
+                                chunk = json.loads(event)
+                            except json.JSONDecodeError:
+                                continue
+                            async for parsed in self._parse_chunk(chunk):
+                                streamed_model_event = True
+                                yield parsed
+                    return
+                except Exception as exc:
+                    if (
+                        streamed_model_event
+                        or attempt >= retry_limit
+                        or not _is_retryable_api_error(exc)
+                    ):
+                        raise
+                    delay = _retry_delay(
+                        exc,
+                        attempt=attempt,
+                        base_delay=max(0.0, float(self.retry_base_delay)),
+                    )
+                    yield {
+                        "type": "llm_retry",
+                        "attempt": attempt + 1,
+                        "max_retries": retry_limit,
+                        "delay_seconds": delay,
+                        "reason": _retry_reason(exc),
+                    }
+                    await asyncio.sleep(delay)
 
     def _format_messages(self, messages: list[Message], system_prompt: str) -> list[dict[str, Any]]:
         formatted: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -193,3 +227,45 @@ def _map_finish_reason(reason: str) -> str:
     if reason == "content_filter":
         return "stop_sequence"
     return "end_turn"
+
+
+def _is_retryable_api_error(error: Exception) -> bool:
+    if isinstance(error, httpx.TransportError):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        return status in {408, 409, 429} or status >= 500
+    return False
+
+
+def _retry_delay(error: Exception, *, attempt: int, base_delay: float) -> float:
+    exponential = base_delay * (2**attempt)
+    if not isinstance(error, httpx.HTTPStatusError):
+        return exponential
+
+    retry_after = error.response.headers.get("retry-after")
+    if not retry_after:
+        return exponential
+    try:
+        header_delay = max(0.0, float(retry_after))
+    except ValueError:
+        try:
+            target = parsedate_to_datetime(retry_after)
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=UTC)
+            header_delay = max(0.0, (target - datetime.now(UTC)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return exponential
+    return max(exponential, header_delay)
+
+
+def _retry_reason(error: Exception) -> str:
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"HTTP {error.response.status_code}"
+    if isinstance(error, httpx.TimeoutException):
+        return "request timeout"
+    if isinstance(error, httpx.ConnectError):
+        return "connection failed"
+    if isinstance(error, httpx.TransportError):
+        return "transport error"
+    return "temporary API error"

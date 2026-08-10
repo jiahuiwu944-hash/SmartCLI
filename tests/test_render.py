@@ -265,3 +265,25 @@ def test_connection_error_is_rendered_without_a_traceback():
     assert "无法连接模型服务" in output
     assert "Traceback" not in output
     assert "raw internal error" not in output
+
+
+def test_llm_retry_is_rendered_with_attempt_delay_and_reason():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console)
+
+    renderer.handle(
+        {
+            "type": "llm_retry",
+            "attempt": 1,
+            "max_retries": 2,
+            "delay_seconds": 0.5,
+            "reason": "HTTP 429",
+        }
+    )
+
+    output = stream.getvalue()
+    assert "Model API Retry" in output
+    assert "1/2" in output
+    assert "HTTP 429" in output
+    assert "0.5s" in output

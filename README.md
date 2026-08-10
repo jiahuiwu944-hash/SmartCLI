@@ -87,6 +87,8 @@ SmartCLI 的配置优先级如下：
 PAICLI_PROVIDER=deepseek
 PAICLI_MODEL=deepseek-v4-flash
 DEEPSEEK_API_KEY=your_key_here
+PAICLI_LLM_MAX_RETRIES=2
+PAICLI_LLM_RETRY_BASE_DELAY=0.5
 ```
 
 也可以使用兼容的 `PAICLI_API_KEY`：

@@ -21,6 +21,8 @@ def test_config_precedence(tmp_path, monkeypatch):
     (project / ".env").write_text("PAICLI_MODEL=env-file-model\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PAICLI_PROVIDER", "process")
+    monkeypatch.setenv("PAICLI_LLM_MAX_RETRIES", "4")
+    monkeypatch.setenv("PAICLI_LLM_RETRY_BASE_DELAY", "0.25")
 
     config = load_config(
         project_root=project,
@@ -29,6 +31,8 @@ def test_config_precedence(tmp_path, monkeypatch):
 
     assert config.llm.provider == "process"
     assert config.llm.model == "cli-model"
+    assert config.llm.max_retries == 4
+    assert config.llm.retry_base_delay == 0.25
 
 
 def test_provider_specific_api_key(tmp_path, monkeypatch):

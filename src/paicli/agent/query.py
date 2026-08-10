@@ -171,6 +171,8 @@ async def query(
                     usage_input += int(usage.get("input_tokens") or 0)
                     usage_output += int(usage.get("output_tokens") or 0)
                     yield {"type": "usage", "usage": usage}
+                elif event_type == "llm_retry":
+                    yield event
                 elif event_type == "error":
                     stream_error = event.get("error") or "Unknown model stream error"
                     break

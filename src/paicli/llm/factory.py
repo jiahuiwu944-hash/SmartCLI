@@ -35,6 +35,8 @@ def create_llm_client(config: LlmConfig) -> OpenAICompatibleClient:
             max_tokens=config.max_tokens,
             temperature=config.temperature,
             timeout=config.timeout,
+            max_retries=config.max_retries,
+            retry_base_delay=config.retry_base_delay,
             max_context_window=context,
             prompt_cache=True,
         )
@@ -47,6 +49,8 @@ def create_llm_client(config: LlmConfig) -> OpenAICompatibleClient:
             max_tokens=config.max_tokens,
             temperature=config.temperature,
             timeout=config.timeout,
+            max_retries=config.max_retries,
+            retry_base_delay=config.retry_base_delay,
             max_context_window=128_000,
             prompt_cache=False,
         )
@@ -59,6 +63,8 @@ def create_llm_client(config: LlmConfig) -> OpenAICompatibleClient:
             max_tokens=config.max_tokens,
             temperature=config.temperature,
             timeout=config.timeout,
+            max_retries=config.max_retries,
+            retry_base_delay=config.retry_base_delay,
             max_context_window=128_000,
             prompt_cache=False,
         )
@@ -70,6 +76,8 @@ def create_llm_client(config: LlmConfig) -> OpenAICompatibleClient:
         max_tokens=config.max_tokens,
         temperature=config.temperature,
         timeout=config.timeout,
+        max_retries=config.max_retries,
+        retry_base_delay=config.retry_base_delay,
         max_context_window=64_000,
         prompt_cache=False,
     )

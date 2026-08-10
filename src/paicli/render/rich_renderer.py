@@ -131,6 +131,10 @@ class RichRenderer:
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
             self._print_run_stopped(event)
+        elif event_type == "llm_retry":
+            self._flush_thinking()
+            self._flush_markdown(title="Assistant Output")
+            self._print_llm_retry(event)
         elif event_type == "error":
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
@@ -292,6 +296,22 @@ class RichRenderer:
                 message,
                 title=Text(f"Agent Stopped · {reason}", style="bold #fb923c"),
                 border_style="#fb923c",
+            )
+        )
+
+    def _print_llm_retry(self, event: dict[str, Any]) -> None:
+        attempt = int(event.get("attempt") or 1)
+        max_retries = int(event.get("max_retries") or 0)
+        delay = float(event.get("delay_seconds") or 0.0)
+        reason = str(event.get("reason") or "temporary API error")
+        self.console.print(
+            _output_panel(
+                f"{reason}; retrying in {delay:g}s.",
+                title=Text(
+                    f"Model API Retry · {attempt}/{max_retries}",
+                    style="bold #facc15",
+                ),
+                border_style="#facc15",
             )
         )
 
