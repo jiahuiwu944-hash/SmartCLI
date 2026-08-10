@@ -8,6 +8,7 @@ from paicli.agent.plan_execute import PlanExecuteAgent
 from paicli.config import PaiCliConfig
 from paicli.llm.base import LlmClient
 from paicli.prompt import PromptAssembler
+from paicli.tools.hooks import ToolHookManager
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, QueryResult
 
@@ -23,6 +24,7 @@ class QueryEngine:
         approval_callback=None,
         continuation_callback=None,
         stop_hook_callback=None,
+        tool_hook_manager: ToolHookManager | None = None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -31,6 +33,7 @@ class QueryEngine:
         self.approval_callback = approval_callback
         self.continuation_callback = continuation_callback
         self.stop_hook_callback = stop_hook_callback
+        self.tool_hook_manager = tool_hook_manager
         self.system_prompt = PromptAssembler(
             config=config,
             cwd=cwd,
@@ -49,6 +52,7 @@ class QueryEngine:
             approval_callback=self.approval_callback,
             continuation_callback=self.continuation_callback,
             stop_hook_callback=self.stop_hook_callback,
+            tool_hook_manager=self.tool_hook_manager,
         )
         agent.history = list(history or [])
         async for event in agent.run(message):
@@ -61,6 +65,7 @@ class QueryEngine:
             config=self.config,
             cwd=self.cwd,
             approval_callback=self.approval_callback,
+            tool_hook_manager=self.tool_hook_manager,
         )
         async for event in agent.run(message):
             yield event
@@ -72,6 +77,7 @@ class QueryEngine:
             config=self.config,
             cwd=self.cwd,
             approval_callback=self.approval_callback,
+            tool_hook_manager=self.tool_hook_manager,
         )
         async for event in orchestrator.run(message):
             yield event

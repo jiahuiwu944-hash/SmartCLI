@@ -1,4 +1,19 @@
 from paicli.tools.builtins import get_builtin_tools
+from paicli.tools.hooks import (
+    PreToolDecision,
+    ToolHookContext,
+    ToolHookManager,
+    ToolLifecycleHook,
+    default_tool_hooks,
+)
 from paicli.tools.registry import ToolRegistry
 
-__all__ = ["ToolRegistry", "get_builtin_tools"]
+__all__ = [
+    "PreToolDecision",
+    "ToolHookContext",
+    "ToolHookManager",
+    "ToolLifecycleHook",
+    "ToolRegistry",
+    "default_tool_hooks",
+    "get_builtin_tools",
+]

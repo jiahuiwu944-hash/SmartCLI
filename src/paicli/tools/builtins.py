@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import glob as glob_module
+import locale
 import os
 import re
 from pathlib import Path
@@ -118,7 +119,7 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="bash",
-            description="Execute a shell command in the current workspace.",
+            description=_shell_tool_description(),
             parameters=object_schema(
                 {
                     "command": {"type": "string", "description": "Shell command"},
@@ -135,7 +136,7 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="execute_command",
-            description="Alias of bash. Execute a shell command in the current workspace.",
+            description=f"Alias of bash. {_shell_tool_description()}",
             parameters=object_schema(
                 {
                     "command": {"type": "string", "description": "Shell command"},
@@ -335,13 +336,48 @@ async def bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
         proc.kill()
         await proc.wait()
         return ToolResult(f"Command timed out after {timeout:.0f}s", is_error=True)
-    output = (stdout + stderr).decode("utf-8", errors="replace")
+    output = _join_shell_output(stdout, stderr)
     if len(output) > 20_000:
         output = output[:20_000] + "\n... [truncated]"
     return ToolResult(
         output or f"(exit {proc.returncode}, no output)",
         is_error=proc.returncode != 0,
     )
+
+
+def _shell_tool_description() -> str:
+    shell = "Windows Command Prompt (cmd.exe)" if os.name == "nt" else "/bin/sh"
+    return (
+        f"Execute a command with {shell} in the current workspace. "
+        "A non-zero exit code is reported as an error; when a probe may legitimately find "
+        "nothing, print a clear no-match result and exit successfully."
+    )
+
+
+def _join_shell_output(stdout: bytes, stderr: bytes) -> str:
+    parts = [_decode_shell_output(value).strip() for value in (stdout, stderr) if value]
+    return "\n".join(part for part in parts if part)
+
+
+def _decode_shell_output(value: bytes) -> str:
+    if not value:
+        return ""
+
+    encodings = ["utf-8", locale.getpreferredencoding(False)]
+    if os.name == "nt":
+        encodings.extend(["mbcs", "gb18030"])
+
+    tried: set[str] = set()
+    for encoding in encodings:
+        normalized = encoding.lower()
+        if normalized in tried:
+            continue
+        tried.add(normalized)
+        try:
+            return value.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return value.decode("utf-8", errors="replace")
 
 
 async def web_search(payload: dict[str, Any], _context: ToolContext) -> ToolResult:

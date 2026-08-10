@@ -13,6 +13,7 @@ from paicli.llm.base import LlmClient
 from paicli.llm.errors import friendly_llm_error, llm_error_event
 from paicli.tools.base import ToolContext
 from paicli.tools.executor import ToolExecutor
+from paicli.tools.hooks import ToolHookManager
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message
 
@@ -29,6 +30,7 @@ async def query(
     approval_callback=None,
     continuation_callback=None,
     stop_hook_callback=None,
+    tool_hook_manager: ToolHookManager | None = None,
     skill_context_buffer=None,
     max_turns: int | None = None,
     stop_hook_enabled: bool | None = None,
@@ -40,7 +42,7 @@ async def query(
         Message(role="user", content=parse_image_references(user_message, cwd)),
     ]
     tool_definitions = tool_registry.definitions()
-    executor = ToolExecutor(tool_registry)
+    executor = ToolExecutor(tool_registry, tool_hook_manager)
     context = ToolContext(
         cwd=cwd,
         config=config,
@@ -405,17 +407,21 @@ async def query(
         else:
             consecutive_tool_error_turns = 0
         if error_limit and consecutive_tool_error_turns >= error_limit:
-            termination_reason = "consecutive_tool_errors"
-            termination_message = (
-                f"Tool execution failed for {consecutive_tool_error_turns} consecutive turns."
+            correction = (
+                f"All tool calls failed for {consecutive_tool_error_turns} consecutive turns. "
+                "Do not repeat the same search pattern. Analyze the returned exit codes and "
+                "errors, then change the command, parameters, tool, or overall approach. "
+                "A search with no matches may be a valid observation rather than a fatal "
+                "failure. If the requested action is unavailable, explain the blocker honestly."
             )
-            yield _run_stopped_event(
-                termination_reason,
-                termination_message,
-                turn,
-                total_tokens,
-            )
-            break
+            messages.append(Message(role="user", content=f"[Runtime feedback]\n{correction}"))
+            yield {
+                "type": "model_redirected",
+                "reason": "consecutive_tool_errors",
+                "message": correction,
+                "streak": consecutive_tool_error_turns,
+            }
+            consecutive_tool_error_turns = 0
 
     yield {
         "type": "done",

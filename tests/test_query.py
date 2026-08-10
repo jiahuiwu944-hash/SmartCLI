@@ -153,20 +153,66 @@ def test_repeated_identical_tool_call_redirects_model_instead_of_stopping(tmp_pa
     assert done["termination_reason"] == "completed"
 
 
-def test_consecutive_tool_error_turns_stop_the_run(tmp_path, monkeypatch):
+class RecoveringToolErrorClient:
+    model_name = "fake-model"
+    provider_name = "fake-provider"
+    max_context_window = 1000
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        if "Stop Hook reviewer" in system_prompt:
+            yield {"type": "text_delta", "text": '{"approved": true, "feedback": ""}'}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+            return
+
+        self.calls += 1
+        if self.calls <= 2:
+            yield {
+                "type": "tool_call_delta",
+                "tool_call": {
+                    "index": 0,
+                    "id": f"call_{self.calls}",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": f'{{"path":"missing-{self.calls}.txt"}}',
+                    },
+                },
+            }
+            yield {"type": "message_end", "stop_reason": "tool_use"}
+            return
+
+        assert any(
+            message.role == "user"
+            and "All tool calls failed for 2 consecutive turns" in str(message.content)
+            for message in messages
+        )
+        yield {"type": "text_delta", "text": "The requested resource is unavailable."}
+        yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+def test_consecutive_tool_error_turns_redirect_the_model(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     config = load_config(project_root=tmp_path)
     config.agent.consecutive_tool_error_limit = 2
     config.agent.max_total_tokens = 0
-    client = LoopingToolClient(repeated=False)
+    client = RecoveringToolErrorClient()
 
     events = asyncio.run(_collect_events(_engine(tmp_path, config, client)))
 
-    stopped = next(event for event in events if event["type"] == "run_stopped")
+    redirected = next(
+        event
+        for event in events
+        if event["type"] == "model_redirected" and event["reason"] == "consecutive_tool_errors"
+    )
     results = [event for event in events if event["type"] == "tool_result"]
-    assert stopped["reason"] == "consecutive_tool_errors"
+    done = next(event for event in events if event["type"] == "done")
+    assert "change the command" in redirected["message"]
     assert len(results) == 2
     assert all(event["is_error"] for event in results)
+    assert not any(event["type"] == "run_stopped" for event in events)
+    assert done["completed"] is True
 
 
 def test_max_turns_remains_a_last_resort_safety_cap(tmp_path, monkeypatch):

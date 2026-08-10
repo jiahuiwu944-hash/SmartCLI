@@ -5,6 +5,7 @@ import asyncio
 from paicli.config import load_config
 from paicli.tools import ToolRegistry, get_builtin_tools
 from paicli.tools.base import ToolContext
+from paicli.tools.builtins import _decode_shell_output
 
 
 def test_read_write_file_tool(tmp_path, monkeypatch):
@@ -30,3 +31,12 @@ def test_read_write_file_tool(tmp_path, monkeypatch):
     assert not write_result.is_error
     assert "1: hello" in read_result.content
     assert "2: world" in read_result.content
+
+
+def test_shell_output_falls_back_to_windows_code_page(monkeypatch):
+    monkeypatch.setattr(
+        "paicli.tools.builtins.locale.getpreferredencoding",
+        lambda _do_setlocale: "cp936",
+    )
+
+    assert _decode_shell_output("QQ音乐.lnk".encode("gb18030")) == "QQ音乐.lnk"

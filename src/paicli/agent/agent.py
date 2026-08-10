@@ -8,6 +8,7 @@ from paicli.config import PaiCliConfig
 from paicli.llm.base import LlmClient
 from paicli.skill import SkillContextBuffer
 from paicli.snapshot import SnapshotService
+from paicli.tools.hooks import ToolHookManager
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, QueryResult
 
@@ -26,6 +27,7 @@ class Agent:
         approval_callback=None,
         continuation_callback=None,
         stop_hook_callback=None,
+        tool_hook_manager: ToolHookManager | None = None,
         max_turns: int | None = None,
     ):
         self.llm_client = llm_client
@@ -36,6 +38,7 @@ class Agent:
         self.approval_callback = approval_callback
         self.continuation_callback = continuation_callback
         self.stop_hook_callback = stop_hook_callback
+        self.tool_hook_manager = tool_hook_manager
         self.max_turns = max_turns if max_turns is not None else config.agent.max_turns
         self.history: list[Message] = []
         self.skill_context_buffer = SkillContextBuffer()
@@ -56,6 +59,7 @@ class Agent:
                 approval_callback=self.approval_callback,
                 continuation_callback=self.continuation_callback,
                 stop_hook_callback=self.stop_hook_callback,
+                tool_hook_manager=self.tool_hook_manager,
                 skill_context_buffer=self.skill_context_buffer,
                 max_turns=self.max_turns,
             ):

@@ -13,6 +13,7 @@ from paicli.plan import ExecutionPlan, Planner, Task, TaskStatus
 from paicli.prompt import PromptAssembler
 from paicli.skill import SkillContextBuffer
 from paicli.snapshot import SnapshotService
+from paicli.tools.hooks import ToolHookManager
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message
 
@@ -35,6 +36,7 @@ class PlanExecuteAgent:
         config: PaiCliConfig,
         cwd: str,
         approval_callback=None,
+        tool_hook_manager: ToolHookManager | None = None,
         planner: Planner | None = None,
         max_task_turns: int = 8,
     ):
@@ -43,6 +45,7 @@ class PlanExecuteAgent:
         self.config = config
         self.cwd = cwd
         self.approval_callback = approval_callback
+        self.tool_hook_manager = tool_hook_manager
         self.planner = planner or Planner(llm_client)
         self.max_task_turns = max_task_turns
         self.history: list[Message] = []
@@ -158,6 +161,7 @@ class PlanExecuteAgent:
                 cwd=self.cwd,
                 config=self.config,
                 approval_callback=self.approval_callback,
+                tool_hook_manager=self.tool_hook_manager,
                 skill_context_buffer=self.skill_context_buffer,
                 max_turns=self.max_task_turns,
                 stop_hook_enabled=False,

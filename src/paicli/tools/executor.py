@@ -3,14 +3,19 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from paicli.policy import AuditLog
-from paicli.tools.base import Tool, ToolContext, ToolDecision, ToolResult
+from paicli.tools.base import Tool, ToolContext, ToolResult
+from paicli.tools.hooks import ToolHookContext, ToolHookManager, default_tool_hooks
 from paicli.tools.registry import ToolRegistry
 
 
 class ToolExecutor:
-    def __init__(self, registry: ToolRegistry):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        hook_manager: ToolHookManager | None = None,
+    ):
         self.registry = registry
+        self.hooks = hook_manager or default_tool_hooks()
 
     async def execute_all(
         self,
@@ -65,78 +70,39 @@ class ToolExecutor:
                 is_error=True,
             )
 
-        audit = AuditLog(context.config.policy.audit_log_path)
-        approver = "none"
+        hook_context = ToolHookContext(
+            tool_call_id=tool_call_id,
+            tool_name=name,
+            tool=tool,
+            input_data=payload,
+            runtime=context,
+        )
         try:
-            data = tool.validate(payload)
-            decision = await self._approval_decision(tool, data, context)
-            if decision in {"deny", "skip"}:
-                approver = "hitl"
-                audit.record(
-                    tool_name=tool.name,
-                    input_data=data,
-                    outcome=decision,
-                    approver=approver,
-                    cwd=context.cwd,
-                )
-                return ToolResult(
+            hook_context.input_data = tool.validate(payload)
+            decision = await self.hooks.run_before(hook_context)
+            if decision.behavior in {"deny", "skip"}:
+                result = ToolResult(
                     tool_use_id=tool_call_id,
-                    content=f'Tool "{tool.name}" was {decision}ed by approval policy.',
+                    content=decision.message
+                    or f'Tool "{tool.name}" was {decision.behavior}ed by a pre-tool hook.',
                     is_error=True,
                 )
-            if tool.requires_approval or context.config.policy.hitl_mode == "always":
-                approver = "hitl"
+                return await self.hooks.run_after(hook_context, result)
 
-            result = await tool.execute(data, context)
+            result = await tool.execute(hook_context.input_data, context)
             result.tool_use_id = tool_call_id
-            if not tool.is_read_only and context.config.features.audit_log:
-                audit.record(
-                    tool_name=tool.name,
-                    input_data=data,
-                    outcome="allow" if not result.is_error else "error",
-                    approver=approver,
-                    cwd=context.cwd,
-                )
+            result = await self.hooks.run_after(hook_context, result)
+            result.tool_use_id = tool_call_id
             return result
         except Exception as exc:  # noqa: BLE001 - tool errors must flow back to the model
-            if context.config.features.audit_log and tool and not tool.is_read_only:
-                audit.record(
-                    tool_name=tool.name,
-                    input_data=payload,
-                    outcome="error",
-                    approver=approver,
-                    cwd=context.cwd,
+            result = await self.hooks.run_error(hook_context, exc)
+            if result is None:
+                result = ToolResult(
+                    content=f'Tool "{name}" execution error: {exc}',
+                    is_error=True,
                 )
-            return ToolResult(
-                tool_use_id=tool_call_id,
-                content=f'Tool "{name}" execution error: {exc}',
-                is_error=True,
-            )
-
-    async def _approval_decision(
-        self,
-        tool: Tool,
-        payload: dict[str, Any],
-        context: ToolContext,
-    ) -> ToolDecision:
-        mode = context.config.policy.hitl_mode
-        if mode == "never":
-            return "approve"
-        if mode == "auto" and not tool.requires_approval:
-            return "approve"
-        if not context.approval_callback:
-            return "deny"
-        result = context.approval_callback(
-            {
-                "tool_name": tool.name,
-                "input": payload,
-                "danger_level": tool.danger_level,
-                "description": tool.description,
-            }
-        )
-        if asyncio.iscoroutine(result):
-            result = await result
-        return result
+            result.tool_use_id = tool_call_id
+            return result
 
 
 def _tool_call_name(call: dict[str, Any]) -> str:

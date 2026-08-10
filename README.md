@@ -124,6 +124,24 @@ PAICLI_AGENT_EXTENSION_TURNS=20
 PAICLI_AGENT_EXTENSION_TOKENS=100000
 ```
 
+### Tool Executor 生命周期 Hook
+
+工具执行器通过统一生命周期 Hook 解耦审批、审计与异常处理：`before_tool` 可修改参数或拒绝调用，`after_tool` 可加工执行结果，`on_tool_error` 可记录异常或转换为模型可理解的反馈。默认 Hook 保留 HITL、JSONL 审计和错误 Tool Result 行为，也可以继续注册自定义 Hook：
+
+```python
+from paicli.tools import ToolLifecycleHook, default_tool_hooks
+
+
+class MetricsHook(ToolLifecycleHook):
+    async def after_tool(self, context, result):
+        print(context.tool_name, result.is_error)
+
+
+hooks = default_tool_hooks()
+hooks.register(MetricsHook())
+# 将 hooks 传给 Agent 或 QueryEngine 的 tool_hook_manager 参数
+```
+
 通过命令行临时覆盖 provider 和 model：
 
 ```bash
