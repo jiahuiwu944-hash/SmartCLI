@@ -20,6 +20,7 @@ class AuditLog:
         outcome: str,
         approver: str,
         cwd: str,
+        details: dict[str, Any] | None = None,
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         event = {
@@ -30,6 +31,8 @@ class AuditLog:
             "approver": approver,
             "cwd": cwd,
         }
+        if details:
+            event["details"] = self._redact(details)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
 

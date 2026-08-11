@@ -10,9 +10,12 @@ from enum import StrEnum
 from typing import Any
 
 from paicli.agent.query import query
+from paicli.agent.verifier import CompletionVerifier
 from paicli.config import PaiCliConfig
 from paicli.llm.base import LlmClient
 from paicli.prompt import PromptAssembler
+from paicli.runtime.budget import BudgetManager
+from paicli.runtime.run_state import RunState, RunStateStore, is_resume_request
 from paicli.skill import SkillContextBuffer
 from paicli.snapshot import SnapshotService
 from paicli.tools.hooks import ToolHookManager
@@ -48,6 +51,10 @@ class AgentMessage:
     from_role: AgentRole | None
     content: str
     type: AgentMessageType
+    tokens: int = 0
+    turns: int = 0
+    tool_successes: int = 0
+    tool_failures: int = 0
 
     @classmethod
     def task(cls, from_agent: str, content: str) -> AgentMessage:
@@ -70,6 +77,9 @@ class ExecutionStep:
     dependencies: list[str]
     result: str = ""
     status: StepStatus = StepStatus.PENDING
+    retry_count: int = 0
+    tokens: int = 0
+    turns: int = 0
 
     def with_result(self, result: str) -> ExecutionStep:
         return replace(self, result=result, status=StepStatus.COMPLETED)
@@ -126,6 +136,10 @@ class SubAgent:
     async def _execute_worker(self, content: str) -> AgentMessage:
         text = ""
         tool_results: list[str] = []
+        tokens = 0
+        turns = 0
+        tool_successes = 0
+        tool_failures = 0
         try:
             async for event in query(
                 llm_client=self.llm_client,
@@ -145,8 +159,14 @@ class SubAgent:
                     text += str(event.get("text") or "")
                 elif event.get("type") == "tool_result":
                     tool_results.append(str(event.get("result") or ""))
+                    if event.get("is_error"):
+                        tool_failures += 1
+                    else:
+                        tool_successes += 1
                 elif event.get("type") == "done":
                     self.history = list(event.get("messages") or [])
+                    turns += int(event.get("total_turns") or 0)
+                    tokens += int(event.get("total_tokens") or 0)
                 elif event.get("type") == "run_stopped":
                     raise RuntimeError(str(event.get("message") or "Agent run stopped"))
                 elif event.get("type") == "error":
@@ -154,10 +174,16 @@ class SubAgent:
         except Exception as exc:  # noqa: BLE001
             return AgentMessage.error(self.name, self.role, str(exc))
         result = text.strip() or "\n".join(item for item in tool_results if item).strip()
-        return AgentMessage.result(self.name, self.role, result)
+        message = AgentMessage.result(self.name, self.role, result)
+        message.tokens = tokens
+        message.turns = turns
+        message.tool_successes = tool_successes
+        message.tool_failures = tool_failures
+        return message
 
     async def _execute_without_tools(self, content: str) -> AgentMessage:
         text = ""
+        tokens = 0
         messages = [*self.history, Message(role="user", content=content)]
         try:
             async for event in self.llm_client.chat(
@@ -167,12 +193,19 @@ class SubAgent:
             ):
                 if event.get("type") == "text_delta":
                     text += str(event.get("text") or "")
+                elif event.get("type") == "usage":
+                    usage = event.get("usage") or {}
+                    tokens += int(usage.get("input_tokens") or 0)
+                    tokens += int(usage.get("output_tokens") or 0)
                 elif event.get("type") == "error":
                     raise event["error"]
         except Exception as exc:  # noqa: BLE001
             return AgentMessage.error(self.name, self.role, str(exc))
         self.history = [*messages, Message(role="assistant", content=text)]
-        return AgentMessage.result(self.name, self.role, text)
+        message = AgentMessage.result(self.name, self.role, text)
+        message.tokens = tokens
+        message.turns = 1
+        return message
 
     def _system_prompt(self) -> str:
         base = PromptAssembler(
@@ -210,6 +243,7 @@ class AgentOrchestrator:
         config: PaiCliConfig,
         cwd: str,
         approval_callback=None,
+        continuation_callback=None,
         tool_hook_manager: ToolHookManager | None = None,
         worker_count: int = 2,
     ):
@@ -218,6 +252,7 @@ class AgentOrchestrator:
         self.config = config
         self.cwd = cwd
         self.approval_callback = approval_callback
+        self.continuation_callback = continuation_callback
         self.tool_hook_manager = tool_hook_manager
         self.skill_context_buffer = SkillContextBuffer()
         self.planner = self._subagent("planner", AgentRole.PLANNER)
@@ -226,6 +261,7 @@ class AgentOrchestrator:
             for index in range(1, max(1, worker_count) + 1)
         ]
         self.reviewer = self._subagent("reviewer", AgentRole.REVIEWER)
+        self.verifier = CompletionVerifier(llm_client)
         self.history: list[Message] = []
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
@@ -233,25 +269,63 @@ class AgentOrchestrator:
         with suppress(Exception):
             snapshot.create("pre-turn")
         final_text = ""
+        termination_reason = "completed"
         try:
-            yield {"type": "text_delta", "text": "Phase 1: planner\n\n"}
-            plan_result = await self.planner.execute(
-                AgentMessage.task("orchestrator", f"Create an execution plan for:\n{message}")
-            )
-            self.planner.clear_history()
-            if plan_result.type == AgentMessageType.ERROR:
-                raise RuntimeError(f"planner failed: {plan_result.content}")
-            steps = self.parse_plan(plan_result.content)
-            if not steps:
-                raise ValueError(f"planner output could not be parsed:\n{plan_result.content}")
+            store = RunStateStore(self.cwd)
+            resumed = store.latest_paused("team") if is_resume_request(message) else None
+            if resumed:
+                state = resumed
+                state.status = "RUNNING"
+                message = state.goal
+                steps = _steps_from_dict(state.payload.get("steps") or [])
+                yield {"type": "text_delta", "text": f"Resuming team {state.run_id}.\n\n"}
+            else:
+                yield {"type": "text_delta", "text": "Phase 1: planner\n\n"}
+                plan_result = await self.planner.execute(
+                    AgentMessage.task("orchestrator", f"Create an execution plan for:\n{message}")
+                )
+                self.planner.clear_history()
+                if plan_result.type == AgentMessageType.ERROR:
+                    raise RuntimeError(f"planner failed: {plan_result.content}")
+                steps = self.parse_plan(plan_result.content)
+                if not steps:
+                    raise ValueError(f"planner output could not be parsed:\n{plan_result.content}")
+                state = store.create("team", message)
+                state.turns = plan_result.turns
+                state.tokens = plan_result.tokens
+                state.payload["steps"] = _steps_to_dict(steps)
+                store.save(state)
             yield {"type": "text_delta", "text": self.summarize_steps(steps) + "\n"}
             yield {"type": "text_delta", "text": "Phase 2: workers and reviewer\n\n"}
+            budget = BudgetManager(
+                turn_limit=self.config.agent.max_turns,
+                token_limit=self.config.agent.max_total_tokens,
+                callback=self.continuation_callback,
+            )
+            budget.turns, budget.tokens = state.turns, state.tokens
             for event in await self._execute_steps(
-                steps, lambda text: {"type": "text_delta", "text": text}
+                steps,
+                lambda text: {"type": "text_delta", "text": text},
+                state,
+                store,
+                budget,
             ):
+                if event.get("type") == "run_stopped":
+                    termination_reason = str(event.get("reason") or "budget")
                 yield event
-            final_text = self.build_final_result(steps)
-            yield {"type": "text_delta", "text": final_text}
+            if state.status == "PAUSED":
+                final_text = f"Team {state.run_id} is paused with execution context saved."
+            else:
+                final_text = self.build_final_result(steps)
+                yield {"type": "text_delta", "text": final_text}
+                state.status = (
+                    "COMPLETED"
+                    if all(step.status == StepStatus.COMPLETED for step in steps)
+                    else "FAILED"
+                )
+                state.payload["steps"] = _steps_to_dict(steps)
+                state.turns, state.tokens = budget.turns, budget.tokens
+                store.save(state)
             self.history = [
                 Message(role="user", content=message),
                 Message(role="assistant", content=final_text),
@@ -262,12 +336,22 @@ class AgentOrchestrator:
         finally:
             with suppress(Exception):
                 snapshot.create("post-turn")
-        yield {"type": "done", "total_turns": 0, "total_tokens": 0, "messages": self.history}
+        yield {
+            "type": "done",
+            "total_turns": state.turns,
+            "total_tokens": state.tokens,
+            "termination_reason": termination_reason,
+            "completed": termination_reason == "completed" and state.status == "COMPLETED",
+            "messages": self.history,
+        }
 
     async def _execute_steps(
         self,
         steps: list[ExecutionStep],
         event_factory,
+        state: RunState,
+        store: RunStateStore,
+        budget: BudgetManager,
     ) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         retry_count: dict[str, int] = {}
@@ -276,6 +360,29 @@ class AgentOrchestrator:
             worker_queue.put_nowait(worker)
 
         while True:
+            if budget.reached():
+                approved, request = await budget.request_extension(
+                    additional_turns=self.config.agent.budget_extension_turns,
+                    additional_tokens=self.config.agent.budget_extension_tokens,
+                    mode="team",
+                )
+                events.append({"type": "budget_extension_requested", **request})
+                if not approved:
+                    state.status = "PAUSED"
+                    state.payload["steps"] = _steps_to_dict(steps)
+                    state.turns, state.tokens = budget.turns, budget.tokens
+                    store.save(state)
+                    events.append(
+                        {
+                            "type": "run_stopped",
+                            "reason": request["reason"],
+                            "message": (
+                                f"Team {state.run_id} paused; run /team 继续 to resume it."
+                            ),
+                        }
+                    )
+                    break
+                events.append({"type": "budget_extended", **request})
             executable = self.get_executable_steps(steps)
             if not executable:
                 break
@@ -285,7 +392,7 @@ class AgentOrchestrator:
                         f"Parallel batch: {', '.join(step.id for step in executable)}\n\n"
                     )
                 )
-            await asyncio.gather(
+            usage = await asyncio.gather(
                 *(
                     self._run_step_with_worker_queue(
                         step,
@@ -296,6 +403,11 @@ class AgentOrchestrator:
                     for step in executable
                 )
             )
+            for turns, tokens in usage:
+                budget.consume(turns=turns, tokens=tokens)
+            state.payload["steps"] = _steps_to_dict(steps)
+            state.turns, state.tokens = budget.turns, budget.tokens
+            store.save(state)
         return events
 
     async def _run_step_with_worker_queue(
@@ -304,11 +416,11 @@ class AgentOrchestrator:
         steps: list[ExecutionStep],
         retry_count: dict[str, int],
         worker_queue: asyncio.Queue[SubAgent],
-    ) -> None:
+    ) -> tuple[int, int]:
         worker = await worker_queue.get()
         try:
             reviewer = self._subagent(f"reviewer-{step.id}", AgentRole.REVIEWER)
-            await self._run_step(step, steps, retry_count, worker, reviewer)
+            return await self._run_step(step, steps, retry_count, worker, reviewer)
         finally:
             worker.clear_history()
             worker_queue.put_nowait(worker)
@@ -320,17 +432,40 @@ class AgentOrchestrator:
         retry_count: dict[str, int],
         worker: SubAgent,
         reviewer: SubAgent,
-    ) -> None:
+    ) -> tuple[int, int]:
         self._update_step(steps, step.id, step.started())
         context = self.build_step_context(steps, step)
         task_msg = AgentMessage.task("orchestrator", step.description)
         result = await worker.execute(task_msg, context)
+        total_turns = result.turns
+        total_tokens = result.tokens
         if result.type == AgentMessageType.ERROR or not result.content.strip():
             self._update_step(steps, step.id, step.with_failed(result.content or "empty result"))
-            return
+            return total_turns, total_tokens
+        evidence = [Message(role="tool", content="TOOL_OK") for _ in range(result.tool_successes)]
+        evidence.extend(
+            Message(role="tool", content='{"is_error": true}') for _ in range(result.tool_failures)
+        )
+        deterministic = self.verifier.verify_task(
+            description=step.description,
+            result=result.content,
+            messages=evidence,
+        )
+        if not deterministic.approved:
+            self._update_step(
+                steps,
+                step.id,
+                step.with_failed(deterministic.feedback),
+            )
+            return total_turns, total_tokens
 
         accepted_result = result.content
-        review = await reviewer.review(step.description, accepted_result)
+        review = await reviewer.review(
+            step.description,
+            _review_evidence(accepted_result, result),
+        )
+        total_turns += review.turns
+        total_tokens += review.tokens
         reviewer.clear_history()
         approved = self.parse_review_approval(review.content)
         issues = self.parse_review_issues(review.content)
@@ -340,16 +475,35 @@ class AgentOrchestrator:
             retry_count[step.id] = retries
             retry_context = context + f"\n\nReviewer rejected the previous result:\n{issues}"
             retry_result = await worker.execute(task_msg, retry_context)
+            total_turns += retry_result.turns
+            total_tokens += retry_result.tokens
             if retry_result.type == AgentMessageType.ERROR or not retry_result.content.strip():
                 issues = retry_result.content or "empty retry result"
                 continue
             accepted_result = retry_result.content
-            retry_review = await reviewer.review(step.description, accepted_result)
+            retry_review = await reviewer.review(
+                step.description,
+                _review_evidence(accepted_result, retry_result),
+            )
+            total_turns += retry_review.turns
+            total_tokens += retry_review.tokens
             reviewer.clear_history()
             approved = self.parse_review_approval(retry_review.content)
             issues = self.parse_review_issues(retry_review.content)
 
-        self._update_step(steps, step.id, step.with_result(accepted_result))
+        current = next(item for item in steps if item.id == step.id)
+        current.retry_count = retries
+        current.turns = total_turns
+        current.tokens = total_tokens
+        if approved:
+            self._update_step(steps, step.id, current.with_result(accepted_result))
+        else:
+            self._update_step(
+                steps,
+                step.id,
+                current.with_failed(issues or "reviewer rejected the result"),
+            )
+        return total_turns, total_tokens
 
     def parse_plan(self, plan_json: str) -> list[ExecutionStep]:
         try:
@@ -502,3 +656,50 @@ def _preview(text: str, max_len: int = 160) -> str:
     if len(value) <= max_len:
         return value
     return value[: max_len - 3] + "..."
+
+
+def _steps_to_dict(steps: list[ExecutionStep]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": step.id,
+            "description": step.description,
+            "type": step.type,
+            "dependencies": step.dependencies,
+            "result": step.result,
+            "status": step.status.value,
+            "retry_count": step.retry_count,
+            "tokens": step.tokens,
+            "turns": step.turns,
+        }
+        for step in steps
+    ]
+
+
+def _steps_from_dict(items: list[dict[str, Any]]) -> list[ExecutionStep]:
+    steps: list[ExecutionStep] = []
+    for item in items:
+        status = StepStatus(str(item.get("status") or "PENDING"))
+        if status == StepStatus.RUNNING:
+            status = StepStatus.PENDING
+        steps.append(
+            ExecutionStep(
+                id=str(item["id"]),
+                description=str(item["description"]),
+                type=str(item.get("type") or "COMMAND"),
+                dependencies=list(item.get("dependencies") or []),
+                result=str(item.get("result") or ""),
+                status=status,
+                retry_count=int(item.get("retry_count") or 0),
+                tokens=int(item.get("tokens") or 0),
+                turns=int(item.get("turns") or 0),
+            )
+        )
+    return steps
+
+
+def _review_evidence(result: str, message: AgentMessage) -> str:
+    return (
+        f"{result}\n\nTool evidence: {message.tool_successes} successful result(s), "
+        f"{message.tool_failures} failed result(s). A failed tool must not be treated as "
+        "successful unless later evidence clearly proves recovery."
+    )

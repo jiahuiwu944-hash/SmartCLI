@@ -65,6 +65,7 @@ class QueryEngine:
             config=self.config,
             cwd=self.cwd,
             approval_callback=self.approval_callback,
+            continuation_callback=self.continuation_callback,
             tool_hook_manager=self.tool_hook_manager,
         )
         async for event in agent.run(message):
@@ -77,6 +78,7 @@ class QueryEngine:
             config=self.config,
             cwd=self.cwd,
             approval_callback=self.approval_callback,
+            continuation_callback=self.continuation_callback,
             tool_hook_manager=self.tool_hook_manager,
         )
         async for event in orchestrator.run(message):
@@ -129,6 +131,8 @@ class QueryEngine:
         text = ""
         tokens = 0
         turns = 0
+        termination_reason = "completed"
+        completed = True
         async for event in events:
             if event.get("type") == "text_delta":
                 text += str(event.get("text") or "")
@@ -137,4 +141,12 @@ class QueryEngine:
             elif event.get("type") == "done":
                 tokens += int(event.get("total_tokens") or 0)
                 turns += int(event.get("total_turns") or 0)
-        return QueryResult(text=text, total_tokens=tokens, turns=turns)
+                termination_reason = str(event.get("termination_reason") or "completed")
+                completed = bool(event.get("completed", termination_reason == "completed"))
+        return QueryResult(
+            text=text,
+            total_tokens=tokens,
+            turns=turns,
+            termination_reason=termination_reason,
+            completed=completed,
+        )

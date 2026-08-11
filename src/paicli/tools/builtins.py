@@ -2,19 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import glob as glob_module
+import json
 import locale
 import os
 import re
 from pathlib import Path
 from typing import Any
 
-from paicli.lsp import diagnose_file
+from paicli.codeintel import CodeNavigator
+from paicli.lsp import diagnose_file as run_diagnostics
 from paicli.memory import MemoryManager
 from paicli.policy import CommandGuard, PathGuard
-from paicli.rag import CodeIndex
 from paicli.skill import SkillRegistry
 from paicli.snapshot import SnapshotService
 from paicli.tools.base import Tool, ToolContext, ToolResult, object_schema
+from paicli.tools.file_version import (
+    MISSING_VERSION,
+    FileChangedDuringWriteError,
+    atomic_write,
+    content_version,
+    file_version,
+)
 from paicli.web import fetch_url, search_web
 
 
@@ -22,7 +30,10 @@ def get_builtin_tools() -> list[Tool]:
     tools = [
         Tool(
             name="read_file",
-            description="Read a text file from the current workspace.",
+            description=(
+                "Read a text file and return its current version. Pass that version to "
+                "write_file when changing an existing file."
+            ),
             parameters=object_schema(
                 {
                     "path": {"type": "string", "description": "Path to read"},
@@ -36,12 +47,22 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="write_file",
-            description="Write a UTF-8 text file inside the current workspace.",
+            description=(
+                "Atomically write a UTF-8 file. Before overwriting or appending, read the "
+                "file and pass its version as expected_version."
+            ),
             parameters=object_schema(
                 {
                     "path": {"type": "string", "description": "Path to write"},
                     "content": {"type": "string", "description": "File content"},
                     "append": {"type": "boolean", "description": "Append instead of overwrite"},
+                    "expected_version": {
+                        "type": "string",
+                        "description": (
+                            "Version returned by read_file, or 'missing' when the file must "
+                            "not already exist"
+                        ),
+                    },
                 },
                 ["path", "content"],
             ),
@@ -204,16 +225,79 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="search_code",
-            description="Search the local code index for semantically relevant lines.",
+            description=(
+                "Unified code navigation search across exact symbols, ripgrep text, and "
+                "FTS5 symbol/docstring data."
+            ),
             parameters=object_schema(
                 {
                     "query": {"type": "string", "description": "Search query"},
+                    "mode": {"type": "string", "description": "auto, symbol, text, or semantic"},
+                    "path": {"type": "string", "description": "Workspace path to search"},
                     "limit": {"type": "number", "description": "Maximum matches"},
                 },
                 ["query"],
             ),
             required_keys=["query"],
             handler=search_code,
+        ),
+        Tool(
+            name="repo_map",
+            description="Return a compact repository map of files and important symbols.",
+            parameters=object_schema(
+                {"max_chars": {"type": "number", "description": "Maximum output characters"}}
+            ),
+            handler=repo_map,
+        ),
+        Tool(
+            name="find_symbol",
+            description="Find class, method, function, or interface definitions by exact name.",
+            parameters=object_schema(
+                {
+                    "name": {"type": "string", "description": "Exact symbol name"},
+                    "kind": {"type": "string", "description": "Optional symbol kind"},
+                    "limit": {"type": "number", "description": "Maximum results"},
+                },
+                ["name"],
+            ),
+            required_keys=["name"],
+            handler=find_symbol,
+        ),
+        Tool(
+            name="find_references",
+            description="Find references to a symbol using ripgrep word matching.",
+            parameters=object_schema(
+                {
+                    "name": {"type": "string", "description": "Symbol name"},
+                    "path": {"type": "string", "description": "Workspace path to search"},
+                    "limit": {"type": "number", "description": "Maximum results"},
+                },
+                ["name"],
+            ),
+            required_keys=["name"],
+            handler=find_references,
+        ),
+        Tool(
+            name="document_symbols",
+            description="List indexed classes, methods, and functions in one source file.",
+            parameters=object_schema(
+                {
+                    "path": {"type": "string", "description": "Source file"},
+                    "limit": {"type": "number", "description": "Maximum symbols"},
+                },
+                ["path"],
+            ),
+            required_keys=["path"],
+            handler=document_symbols,
+        ),
+        Tool(
+            name="diagnose_file",
+            description="Run available local syntax diagnostics for a source file.",
+            parameters=object_schema(
+                {"path": {"type": "string", "description": "Source file"}}, ["path"]
+            ),
+            required_keys=["path"],
+            handler=diagnose_source_file,
         ),
         Tool(
             name="revert_turn",
@@ -237,27 +321,151 @@ async def read_file(payload: dict[str, Any], context: ToolContext) -> ToolResult
     path = _resolve_path(context, str(payload["path"]))
     offset = max(int(payload.get("offset") or 1), 1)
     limit = int(payload.get("limit") or 500)
-    content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    raw_content = path.read_bytes()
+    version = content_version(raw_content)
+    content = raw_content.decode("utf-8", errors="replace").splitlines()
     selected = content[offset - 1 : offset - 1 + limit]
     numbered = "\n".join(f"{idx + offset}: {line}" for idx, line in enumerate(selected))
-    return ToolResult(numbered, display_summary=f"Read {path.relative_to(context.cwd)}")
+    relative_path = path.relative_to(context.cwd)
+    metadata = (
+        "[FILE_METADATA]\n"
+        f"path: {relative_path}\n"
+        f"version: {version}\n"
+        f"size: {len(raw_content)}\n"
+        "[FILE_CONTENT]"
+    )
+    end_line = offset + len(selected) - 1
+    ledger = context.context_ledger
+    if ledger is not None and ledger.seen(str(relative_path), offset, end_line, version):
+        return ToolResult(
+            f"{metadata}\n[CONTEXT_REUSE] This exact file version and line range was already "
+            "read in the current run. Reuse the existing context instead of consuming it again.",
+            display_summary=f"Reuse {relative_path}:{offset}-{end_line}",
+        )
+    if ledger is not None:
+        ledger.record(str(relative_path), offset, end_line, version)
+    return ToolResult(
+        f"{metadata}\n{numbered}",
+        display_summary=f"Read {relative_path} ({version[:19]}...)",
+    )
 
 
 async def write_file(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     path = _resolve_path(context, str(payload["path"]))
     content = str(payload["content"])
-    if len(content.encode("utf-8")) > 5 * 1024 * 1024:
+    content_bytes = content.encode("utf-8")
+    append = bool(payload.get("append"))
+    expected_version = payload.get("expected_version")
+    expected_version = str(expected_version) if expected_version is not None else None
+    current_content = path.read_bytes() if path.exists() else b""
+    current_version = file_version(path)
+    desired_content = current_content + content_bytes if append else content_bytes
+    desired_version = content_version(desired_content)
+    if len(desired_content) > 5 * 1024 * 1024:
         return ToolResult("write_file rejected: content exceeds 5MB", is_error=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = "a" if payload.get("append") else "w"
-    with path.open(mode, encoding="utf-8") as handle:
-        handle.write(content)
+
+    relative_path = path.relative_to(context.cwd)
+    if current_version == desired_version:
+        return ToolResult(
+            _file_result(
+                "WRITE_NOOP",
+                relative_path,
+                version=current_version,
+                message="Target content is already present; no file write was performed.",
+            ),
+            display_summary=f"No change {relative_path}",
+        )
+
+    check_mode = _file_version_check_mode(context)
+    if check_mode != "off" and expected_version is not None:
+        if expected_version != current_version:
+            return _version_conflict_result(
+                relative_path,
+                expected_version=expected_version,
+                actual_version=current_version,
+            )
+    elif check_mode == "enforce" and current_version != MISSING_VERSION:
+        return ToolResult(
+            _file_result(
+                "FILE_VERSION_REQUIRED",
+                relative_path,
+                actual_version=current_version,
+                retryable=True,
+                suggested_action=(
+                    "Call read_file and pass its version as expected_version before overwriting "
+                    "or appending."
+                ),
+            ),
+            is_error=True,
+            display_summary=f"Version required {relative_path}",
+        )
+
+    warning = None
+    if check_mode == "warn" and expected_version is None and current_version != MISSING_VERSION:
+        warning = "Existing file was written without expected_version."
+
+    try:
+        if context.config.tools.atomic_file_write:
+            atomic_write(path, desired_content, observed_version=current_version)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(desired_content)
+    except FileChangedDuringWriteError as exc:
+        return _version_conflict_result(
+            relative_path,
+            expected_version=current_version,
+            actual_version=exc.actual_version,
+        )
+
+    new_version = file_version(path)
     rel = path.relative_to(context.cwd)
-    diagnostics = diagnose_file(path)
-    suffix = ""
-    if diagnostics:
-        suffix = "\n\nDiagnostics:\n" + "\n".join(diagnostics)
-    return ToolResult(f"Wrote {rel}{suffix}", display_summary=f"Wrote {rel}")
+    diagnostics = run_diagnostics(path)
+    result = _file_result(
+        "WRITE_OK",
+        relative_path,
+        previous_version=current_version,
+        version=new_version,
+        atomic=context.config.tools.atomic_file_write,
+        warning=warning,
+        diagnostics=diagnostics or None,
+    )
+    return ToolResult(result, display_summary=f"Wrote {rel} ({new_version[:19]}...)")
+
+
+def _file_version_check_mode(context: ToolContext) -> str:
+    mode = str(context.config.tools.file_version_check or "warn").lower()
+    return mode if mode in {"off", "warn", "enforce"} else "warn"
+
+
+def _version_conflict_result(
+    path: Path,
+    *,
+    expected_version: str,
+    actual_version: str,
+) -> ToolResult:
+    return ToolResult(
+        _file_result(
+            "FILE_VERSION_CONFLICT",
+            path,
+            expected_version=expected_version,
+            actual_version=actual_version,
+            retryable=True,
+            suggested_action=(
+                "Call read_file again, regenerate the change from the latest content, and retry "
+                "with the new version. Do not force an overwrite."
+            ),
+        ),
+        is_error=True,
+        display_summary=f"Version conflict {path}",
+    )
+
+
+def _file_result(status: str, path: Path, **details: Any) -> str:
+    return json.dumps(
+        {"status": status, "path": str(path), **details},
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 async def list_dir(payload: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -291,32 +499,19 @@ async def glob_files(payload: dict[str, Any], context: ToolContext) -> ToolResul
 
 
 async def grep(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    root = Path(context.cwd).resolve()
-    start = _resolve_path(context, str(payload.get("path") or "."))
     pattern = str(payload["pattern"])
     limit = int(payload.get("limit") or 100)
     use_regex = bool(payload.get("regex", True))
     try:
-        compiled = re.compile(pattern) if use_regex else None
-    except re.error as exc:
-        return ToolResult(f"invalid regex: {exc}", is_error=True)
-
-    matches: list[str] = []
-    files = [start] if start.is_file() else [p for p in start.rglob("*") if p.is_file()]
-    for file_path in files:
-        if _skip_file(file_path):
-            continue
-        try:
-            lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            continue
-        for line_number, line in enumerate(lines, start=1):
-            found = bool(compiled.search(line)) if compiled else pattern in line
-            if found:
-                matches.append(f"{file_path.relative_to(root)}:{line_number}: {line.strip()}")
-                if len(matches) >= limit:
-                    return ToolResult("\n".join(matches))
-    return ToolResult("\n".join(matches) or "(no matches)")
+        matches, truncated = _navigator(context).scanner.search(
+            pattern,
+            path=str(payload.get("path") or "."),
+            regex=use_regex,
+            limit=limit,
+        )
+    except (RuntimeError, re.error) as exc:
+        return ToolResult(f"grep failed: {exc}", is_error=True)
+    return ToolResult(_search_result_json(matches, truncated=truncated))
 
 
 async def bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -429,11 +624,119 @@ async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResul
 
 
 async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    index = CodeIndex(context.cwd)
-    results = index.search(str(payload["query"]), limit=int(payload.get("limit") or 20))
-    if not results:
-        return ToolResult("(no indexed matches; run /index first)")
-    return ToolResult("\n".join(f"{item.path}:{item.line}: {item.snippet}" for item in results))
+    results, truncated = _navigator(context).search(
+        str(payload["query"]),
+        mode=str(payload.get("mode") or "auto"),
+        path=str(payload.get("path") or "."),
+        limit=int(payload.get("limit") or 20),
+    )
+    return ToolResult(_search_result_json(results, truncated=truncated))
+
+
+async def repo_map(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    max_chars = max(1000, min(int(payload.get("max_chars") or 12_000), 20_000))
+    return ToolResult(_navigator(context).repo_map(max_chars=max_chars))
+
+
+async def find_symbol(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    symbols = _navigator(context).find_symbol(
+        str(payload["name"]),
+        kind=str(payload.get("kind") or ""),
+        limit=int(payload.get("limit") or 20),
+    )
+    rows = [
+        {
+            "path": item.path,
+            "name": item.name,
+            "kind": item.kind,
+            "parent_name": item.parent_name,
+            "signature": item.signature,
+            "start_line": item.start_line,
+            "end_line": item.end_line,
+            "docstring": item.docstring,
+            "file_version": f"sha256:{item.file_version}",
+        }
+        for item in symbols
+    ]
+    return ToolResult(json.dumps({"symbols": rows}, ensure_ascii=False, indent=2))
+
+
+async def find_references(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    results, truncated = _navigator(context).find_references(
+        str(payload["name"]),
+        path=str(payload.get("path") or "."),
+        limit=int(payload.get("limit") or 50),
+    )
+    return ToolResult(_search_result_json(results, truncated=truncated))
+
+
+async def document_symbols(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    path = str(Path(str(payload["path"])))
+    symbols = _navigator(context).document_symbols(
+        path,
+        limit=int(payload.get("limit") or 100),
+    )
+    return ToolResult(
+        json.dumps(
+            {
+                "path": path,
+                "symbols": [
+                    {
+                        "name": item.name,
+                        "kind": item.kind,
+                        "parent_name": item.parent_name,
+                        "signature": item.signature,
+                        "start_line": item.start_line,
+                        "end_line": item.end_line,
+                    }
+                    for item in symbols
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+async def diagnose_source_file(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    path = _resolve_path(context, str(payload["path"]))
+    diagnostics = run_diagnostics(path)
+    return ToolResult(
+        json.dumps(
+            {"path": str(path.relative_to(context.cwd)), "diagnostics": diagnostics},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        is_error=bool(diagnostics),
+    )
+
+
+def _navigator(context: ToolContext) -> CodeNavigator:
+    if context.code_navigator is None:
+        context.code_navigator = CodeNavigator(context.cwd)
+    return context.code_navigator
+
+
+def _search_result_json(results, *, truncated: bool) -> str:
+    return json.dumps(
+        {
+            "matches": [
+                {
+                    "path": item.path,
+                    "start_line": item.start_line,
+                    "end_line": item.end_line,
+                    "snippet": item.snippet,
+                    "symbol": item.symbol,
+                    "reason": item.reason,
+                    "file_version": item.file_version,
+                }
+                for item in results
+            ],
+            "truncated": truncated,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 async def revert_turn(payload: dict[str, Any], context: ToolContext) -> ToolResult:

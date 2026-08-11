@@ -27,6 +27,8 @@ class ToolContext:
         None
     )
     skill_context_buffer: Any | None = None
+    code_navigator: Any | None = None
+    context_ledger: Any | None = None
 
 
 @dataclass(slots=True)

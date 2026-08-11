@@ -48,6 +48,8 @@ class ToolsConfig:
     timeout: float = 60.0
     batch_timeout: float = 90.0
     max_concurrent_read: int = 4
+    file_version_check: str = "warn"
+    atomic_file_write: bool = True
 
 
 @dataclass(slots=True)
@@ -201,6 +203,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     agent = result.setdefault("agent", {})
     features = result.setdefault("features", {})
     policy = result.setdefault("policy", {})
+    tools = result.setdefault("tools", {})
 
     mappings: list[tuple[str, str, Any]] = [
         ("PAICLI_API_KEY", "api_key", str),
@@ -234,6 +237,16 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 agent[config_key] = caster(raw)
+
+    tool_mappings: list[tuple[str, str, Any]] = [
+        ("PAICLI_FILE_VERSION_CHECK", "file_version_check", str),
+        ("PAICLI_ATOMIC_FILE_WRITE", "atomic_file_write", _parse_bool),
+    ]
+    for env_key, config_key, caster in tool_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                tools[config_key] = caster(raw)
 
     provider = str(llm.get("provider") or "").lower()
     if not llm.get("api_key"):
@@ -270,6 +283,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("PAICLI_MCP", "mcp"),
         ("PAICLI_SKILL", "skill"),
         ("PAICLI_MEMORY", "memory"),
+        ("PAICLI_CODE_INDEX", "code_index"),
     ]:
         raw = env.get(env_key)
         if raw == "false":

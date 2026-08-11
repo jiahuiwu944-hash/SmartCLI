@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from contextlib import suppress
 from dataclasses import dataclass, field
 from inspect import isawaitable
@@ -154,12 +155,17 @@ class AuditHook(ToolLifecycleHook):
             not context.tool.is_read_only and context.runtime.config.features.audit_log
         )
         if should_record:
+            warning = _result_warning(result)
             outcome = (
                 decision
                 if decision in {"deny", "skip"}
-                else ("error" if result.is_error else "allow")
+                else ("error" if result.is_error else ("warning" if warning else "allow"))
             )
-            self._record(context, outcome)
+            self._record(
+                context,
+                outcome,
+                details={"warning": warning} if warning else None,
+            )
         return None
 
     async def on_tool_error(
@@ -172,7 +178,12 @@ class AuditHook(ToolLifecycleHook):
         return None
 
     @staticmethod
-    def _record(context: ToolHookContext, outcome: str) -> None:
+    def _record(
+        context: ToolHookContext,
+        outcome: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         with suppress(Exception):
             AuditLog(context.runtime.config.policy.audit_log_path).record(
                 tool_name=context.tool.name,
@@ -180,7 +191,29 @@ class AuditHook(ToolLifecycleHook):
                 outcome=outcome,
                 approver=str(context.metadata.get("approver") or "none"),
                 cwd=context.runtime.cwd,
+                details=details,
             )
+
+
+class CodeIndexRefreshHook(ToolLifecycleHook):
+    """Keep the code navigation index aligned with successful workspace writes."""
+
+    priority = 2_500
+
+    async def after_tool(
+        self,
+        context: ToolHookContext,
+        result: ToolResult,
+    ) -> ToolResult | None:
+        navigator = context.runtime.code_navigator
+        if navigator is None or result.is_error:
+            return None
+        with suppress(Exception):
+            if context.tool_name == "write_file" and context.input_data.get("path"):
+                navigator.refresh_file(str(context.input_data["path"]))
+            elif context.tool_name in {"bash", "execute_command"}:
+                navigator.update()
+        return None
 
 
 class ErrorResultHook(ToolLifecycleHook):
@@ -199,4 +232,14 @@ class ErrorResultHook(ToolLifecycleHook):
 
 
 def default_tool_hooks() -> ToolHookManager:
-    return ToolHookManager([ApprovalHook(), AuditHook(), ErrorResultHook()])
+    return ToolHookManager([ApprovalHook(), AuditHook(), CodeIndexRefreshHook(), ErrorResultHook()])
+
+
+def _result_warning(result: ToolResult) -> str:
+    try:
+        payload = json.loads(result.content)
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("warning") or "")

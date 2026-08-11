@@ -35,7 +35,23 @@ class PromptAssembler:
             "- Be concise, direct, and implementation-oriented.",
             "- Use tools to inspect files, search code, and verify behavior when needed.",
             "- Prefer deterministic local tools before guessing.",
+            "- If an exact file path is known, call read_file directly; do not search the "
+            "whole repository.",
+            "- If a class, method, or function name is known, prefer find_symbol or "
+            "find_references.",
+            "- For natural-language code questions, use search_code to locate candidates, "
+            "then read_file to verify the current source.",
+            "- Search results and the repo map are navigation hints, not authoritative "
+            "file content.",
+            "- If a search returns nothing, change the keyword, symbol, search mode, or "
+            "reference direction instead of repeating it.",
+            "- Before changing code, inspect the target symbol, its callers, and relevant "
+            "tests; after changing it, run diagnose_file or tests.",
             "- When writing files, use write_file and keep changes scoped.",
+            "- Before overwriting or appending to an existing file, call read_file and pass "
+            "its returned version to write_file as expected_version.",
+            "- If write_file returns FILE_VERSION_CONFLICT, read the file again and rebuild "
+            "the change from the latest content; never guess a version or force an overwrite.",
             "- Preserve URLs and user-provided identifiers exactly unless a tool result proves "
             "otherwise.",
             "- Ask a clarifying question only when proceeding would be risky.",

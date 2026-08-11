@@ -23,7 +23,7 @@ SmartCLI 是一个为了深入学习和探索 AI Agent 核心机制而开发的�
 - OpenAI-compatible 流式 LLM 客户端，默认面向 DeepSeek 配置
 - 支持 `DEEPSEEK_API_KEY` 等 provider-specific API Key
 - ReAct 动态执行循环：任务完成时自然结束，并通过轮次、Token、运行时间、重复调用和连续错误预算防止失控
-- Plan-and-Execute 模式，使用独立 Planner 生成 DAG，并按依赖批次执行可并行任务
+- Plan-and-Execute 模式，使用独立 Planner 生成 DAG，按依赖并行执行，并在任务级与计划级校验完成证据
 - Multi-Agent 协作模式，包含 Planner、Worker、Reviewer、依赖调度、并行 worker 和 review 重试
 - 内置文件、Shell、grep、glob、记忆、网页搜索、网页抓取、代码搜索等工具
 - HITL 人工确认、命令/路径安全策略和 JSONL 审计日志
@@ -32,7 +32,8 @@ SmartCLI 是一个为了深入学习和探索 AI Agent 核心机制而开发的�
 - Chrome DevTools MCP 配置助手
 - SmartCLI 自身也可以作为 MCP server 暴露内置工具
 - Runtime API，支持线程、turn、事件日志和持久化后台任务
-- SQLite 长期记忆和本地代码索引
+- Agentic Code Navigation：ripgrep、Repo Map、符号/FTS5 索引、引用查找、上下文去重与增量刷新
+- Plan/Team 运行状态原子持久化，预算耗尽后可从 `.paicli/runs` 断点续跑
 - Agent run 前后自动创建快照，支持恢复现场
 - 支持本地图片和远程图片输入，并根据模型能力自动降级
 
@@ -89,6 +90,9 @@ PAICLI_MODEL=deepseek-v4-flash
 DEEPSEEK_API_KEY=your_key_here
 PAICLI_LLM_MAX_RETRIES=2
 PAICLI_LLM_RETRY_BASE_DELAY=0.5
+PAICLI_FILE_VERSION_CHECK=warn
+PAICLI_ATOMIC_FILE_WRITE=true
+PAICLI_CODE_INDEX=true
 ```
 
 也可以使用兼容的 `PAICLI_API_KEY`：
@@ -110,7 +114,11 @@ PAICLI_API_KEY=your_key_here
 
 模型准备结束任务时，SmartCLI 会调用 Stop Hook 审查答案是否完成目标、是否具备工具或测试证据，并在 LLM 审查前确定性拦截“工具被跳过却声称全部完成”等矛盾；审查不通过时，反馈会写回当前上下文并驱动 Agent 继续修正。检测到连续相同的工具和参数时不会立即终止，而是跳过重复执行并要求模型更换参数、工具或方案。
 
-达到轮次或总 Token 上限后，交互终端会询问是否追加预算。用户同意后沿用完整消息与工具上下文继续执行；拒绝时上下文仍保存在当前 Agent 会话中，可通过后续消息继续。
+达到轮次或总 Token 上限后，交互终端会询问是否追加预算。ReAct 保留完整消息与工具上下文；Plan/Team 由 Orchestrator 统一询问一次，并把 DAG、步骤状态、重试次数、结果和预算原子保存到 `.paicli/runs`，之后可用 `/plan 继续` 或 `/team 继续` 恢复未完成任务。
+
+### 智能代码导航
+
+`search_code` 是统一入口：已知符号优先命中函数、类和方法索引，普通关键词使用 ripgrep，概念查询再由 SQLite FTS5 兜底。`repo_map` 提供小型项目地图，`find_symbol`、`find_references` 和 `document_symbols` 用于逐步缩小代码范围，最终仍以 `read_file` 读取的实时源码为准。索引用文件 SHA-256 做增量判断，并在 `write_file` 或 Shell 修改成功后通过 Post Tool Hook 自动刷新；`ContextLedger` 会阻止相同文件版本与行区间被重复注入上下文。
 
 模型服务连接失败、超时或返回 HTTP 错误时，终端仅显示可操作的错误提示，不展开内部堆栈；当前消息和已有工具上下文会保留，连接恢复后可直接输入“继续”。
 
@@ -177,8 +185,8 @@ uv run smartcli -p "解释这个仓库"
 /hitl on|off|always|auto|never
 /policy
 /audit [N]
-/index [path]
-/search <query>
+/index [path]              # incrementally refresh SHA-256/symbol/FTS5 index
+/search <query>            # symbol + ripgrep + FTS5 navigation search
 /plan <task>
 /team <task>
 /model

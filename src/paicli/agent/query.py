@@ -7,6 +7,7 @@ from time import monotonic
 from typing import Any
 
 from paicli.agent.stop_hook import StopHookResult, verify_answer
+from paicli.codeintel import CodeNavigator, ContextLedger
 from paicli.config import PaiCliConfig
 from paicli.image import parse_image_references
 from paicli.llm.base import LlmClient
@@ -48,6 +49,8 @@ async def query(
         config=config,
         approval_callback=approval_callback,
         skill_context_buffer=skill_context_buffer,
+        code_navigator=CodeNavigator(cwd) if config.features.code_index else None,
+        context_ledger=ContextLedger(),
     )
 
     total_tokens = 0

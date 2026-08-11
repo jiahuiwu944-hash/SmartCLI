@@ -17,12 +17,12 @@ from rich.table import Table
 from paicli import __version__
 from paicli.agent import Agent, AgentOrchestrator, PlanExecuteAgent
 from paicli.bootstrap import build_tool_registry
+from paicli.codeintel import CodeNavigator
 from paicli.config import PaiCliConfig, config_to_public_dict
 from paicli.llm import create_llm_client
 from paicli.memory import MemoryManager
 from paicli.policy import AuditLog
 from paicli.prompt import PromptAssembler
-from paicli.rag import CodeIndex
 from paicli.render import RichRenderer
 from paicli.runtime import DurableTaskManager
 from paicli.skill import SkillRegistry
@@ -208,11 +208,17 @@ async def _handle_slash(
             json.dumps(AuditLog(config.policy.audit_log_path).tail(limit), ensure_ascii=False)
         )
     elif command == "/index":
-        count = CodeIndex(cwd).rebuild(arg or ".")
-        console.print(f"Indexed {count} code lines.")
+        stats = CodeNavigator(cwd).update(arg or None)
+        console.print(
+            "Code index updated: "
+            f"{stats['changed']} changed, {stats['skipped']} unchanged, "
+            f"{stats['removed']} removed."
+        )
     elif command == "/search":
-        results = CodeIndex(cwd).search(arg, limit=20)
-        output = "\n".join(f"{r.path}:{r.line}: {r.snippet}" for r in results)
+        results, truncated = CodeNavigator(cwd).search(arg, limit=20)
+        output = "\n".join(f"{r.path}:{r.start_line}: {r.snippet} [{r.reason}]" for r in results)
+        if truncated:
+            output += "\n(results truncated; refine the query)"
         console.print(output or "(no matches)")
     elif command == "/plan":
         if not arg:
@@ -224,6 +230,7 @@ async def _handle_slash(
                 config=config,
                 cwd=cwd,
                 approval_callback=agent.approval_callback,
+                continuation_callback=agent.continuation_callback,
             )
             await _run_events(
                 plan_agent.run(arg),
@@ -240,6 +247,7 @@ async def _handle_slash(
                 config=config,
                 cwd=cwd,
                 approval_callback=agent.approval_callback,
+                continuation_callback=agent.continuation_callback,
             )
             await _run_events(
                 orchestrator.run(arg),

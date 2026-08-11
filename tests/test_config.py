@@ -23,6 +23,9 @@ def test_config_precedence(tmp_path, monkeypatch):
     monkeypatch.setenv("PAICLI_PROVIDER", "process")
     monkeypatch.setenv("PAICLI_LLM_MAX_RETRIES", "4")
     monkeypatch.setenv("PAICLI_LLM_RETRY_BASE_DELAY", "0.25")
+    monkeypatch.setenv("PAICLI_FILE_VERSION_CHECK", "enforce")
+    monkeypatch.setenv("PAICLI_ATOMIC_FILE_WRITE", "false")
+    monkeypatch.setenv("PAICLI_CODE_INDEX", "false")
 
     config = load_config(
         project_root=project,
@@ -33,6 +36,9 @@ def test_config_precedence(tmp_path, monkeypatch):
     assert config.llm.model == "cli-model"
     assert config.llm.max_retries == 4
     assert config.llm.retry_base_delay == 0.25
+    assert config.tools.file_version_check == "enforce"
+    assert config.tools.atomic_file_write is False
+    assert config.features.code_index is False
 
 
 def test_provider_specific_api_key(tmp_path, monkeypatch):
