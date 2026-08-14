@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 from paicli.codeintel import CodeNavigator, ContextLedger
 from paicli.config import load_config
@@ -54,6 +55,55 @@ def test_search_code_uses_structured_results_and_gitignore(tmp_path):
     assert results
     assert all(item.path != "ignored.py" for item in results)
     assert any(item.reason in {"exact symbol match", "ripgrep text match"} for item in results)
+
+
+def test_search_code_unifies_symbol_text_and_reference_modes(tmp_path):
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "service.py").write_text(
+        "class TargetService:\n    pass\n",
+        encoding="utf-8",
+    )
+    (source_dir / "caller.py").write_text(
+        "from service import TargetService\nTargetService()\n",
+        encoding="utf-8",
+    )
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    (other_dir / "duplicate.py").write_text(
+        "class TargetService:\n    pass\n",
+        encoding="utf-8",
+    )
+    navigator = CodeNavigator(tmp_path)
+
+    symbols, _ = navigator.search("TargetService", mode="symbol", path="src")
+    text, _ = navigator.search(r"TargetService\(\)", mode="text", path="src", regex=True)
+    references, _ = navigator.search("TargetService", mode="references", path="src")
+
+    assert symbols
+    assert {item.path for item in symbols} == {str(Path("src/service.py"))}
+    assert any(item.path == str(Path("src/caller.py")) for item in text)
+    assert any(item.path == str(Path("src/caller.py")) for item in references)
+
+
+def test_navigation_tool_surface_uses_unified_search_entry():
+    names = {tool.name for tool in get_builtin_tools()}
+
+    assert {"search_code", "repo_map", "document_symbols"} <= names
+    assert "find_symbol" not in names
+    assert "find_references" not in names
+    assert "grep_code" not in names
+
+
+def test_search_code_rejects_removed_fts_mode(tmp_path):
+    navigator = CodeNavigator(tmp_path)
+
+    try:
+        navigator.search("approval", mode="semantic")
+    except ValueError as exc:
+        assert "unsupported search mode" in str(exc)
+    else:
+        raise AssertionError("removed semantic mode should be rejected")
 
 
 def test_context_ledger_avoids_reinjecting_same_file_region(tmp_path, monkeypatch):

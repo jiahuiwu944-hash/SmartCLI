@@ -37,10 +37,15 @@ class PromptAssembler:
             "- Prefer deterministic local tools before guessing.",
             "- If an exact file path is known, call read_file directly; do not search the "
             "whole repository.",
-            "- If a class, method, or function name is known, prefer find_symbol or "
-            "find_references.",
-            "- For natural-language code questions, use search_code to locate candidates, "
-            "then read_file to verify the current source.",
+            "- If the project structure is unknown, use repo_map to identify likely modules; "
+            "do not call it when an exact path or search scope is already known.",
+            "- Use search_code as the unified code search entry: symbol for exact definitions, "
+            "text for literal or regex matches, references for possible usages, and auto when "
+            "the best strategy is unclear.",
+            "- If an exact file path is known but its internal structure is unclear, use "
+            "document_symbols before reading only the relevant source range.",
+            "- Treat search_code, repo_map, and document_symbols results as candidates; call "
+            "read_file to verify the current source before making changes.",
             "- Search results and the repo map are navigation hints, not authoritative "
             "file content.",
             "- If a search returns nothing, change the keyword, symbol, search mode, or "

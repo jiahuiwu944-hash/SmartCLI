@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -64,8 +66,17 @@ class CodeNavigator:
             digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
             self._replace_file(conn, file_path, relative, digest)
 
-    def find_symbol(self, name: str, *, kind: str = "", limit: int = 20) -> list[Symbol]:
-        self.update()
+    def find_symbol(
+        self,
+        name: str,
+        *,
+        kind: str = "",
+        path: str = ".",
+        limit: int = 20,
+        refresh: bool = True,
+    ) -> list[Symbol]:
+        if refresh:
+            self.update(path if path != "." else None)
         query = (
             "select path, name, kind, parent_name, signature, start_line, end_line, "
             "docstring, file_sha256 from symbols "
@@ -75,6 +86,9 @@ class CodeNavigator:
         if kind:
             query += " and lower(kind) = lower(?)"
             params.append(kind)
+        path_clause, path_params = self._symbol_path_filter(path)
+        query += path_clause
+        params.extend(path_params)
         query += " order by path, start_line limit ?"
         params.append(max(1, min(limit, 50)))
         with self._connect() as conn:
@@ -101,14 +115,31 @@ class CodeNavigator:
         *,
         mode: str = "auto",
         path: str = ".",
+        kind: str = "",
+        regex: bool = False,
         limit: int = 20,
     ) -> tuple[list[SearchResult], bool]:
-        self.update(path if path != "." else None)
+        query = query.strip()
+        if not query:
+            raise ValueError("search query must not be empty")
+        mode = mode.strip().lower()
+        allowed_modes = {"auto", "symbol", "text", "references"}
+        if mode not in allowed_modes:
+            supported = ", ".join(sorted(allowed_modes))
+            raise ValueError(f"unsupported search mode: {mode}; expected one of {supported}")
+
         capped_limit = max(1, min(limit, 50))
         results: list[SearchResult] = []
-        identifier = query.strip().replace(".", "").replace("_", "").isalnum()
+        identifier = query.replace(".", "").replace("_", "").isalnum()
         if mode in {"auto", "symbol"} and identifier:
-            for symbol in self.find_symbol(query.strip(), limit=capped_limit):
+            self.update(path if path != "." else None)
+            for symbol in self.find_symbol(
+                query,
+                kind=kind,
+                path=path,
+                limit=capped_limit,
+                refresh=False,
+            ):
                 results.append(
                     SearchResult(
                         path=symbol.path,
@@ -125,16 +156,21 @@ class CodeNavigator:
             text_results, truncated = self.scanner.search(
                 query,
                 path=path,
-                regex=False,
+                regex=regex if mode == "text" else False,
                 limit=capped_limit - len(results),
             )
             results.extend(text_results)
-        if mode in {"auto", "semantic"} and len(results) < capped_limit:
-            results.extend(self._fts_search(query, capped_limit - len(results)))
+        if mode == "references":
+            reference_results, truncated = self.find_references(
+                query,
+                path=path,
+                limit=capped_limit,
+            )
+            results.extend(reference_results)
         deduplicated: list[SearchResult] = []
-        seen: set[tuple[str, int, str]] = set()
+        seen: set[tuple[str, int]] = set()
         for result in results:
-            key = (result.path, result.start_line, result.reason)
+            key = (result.path, result.start_line)
             if key not in seen:
                 seen.add(key)
                 deduplicated.append(result)
@@ -142,7 +178,7 @@ class CodeNavigator:
 
     def find_references(self, name: str, *, path: str = ".", limit: int = 50):
         return self.scanner.search(
-            rf"\b{name}\b",
+            rf"\b{re.escape(name)}\b",
             path=path,
             regex=True,
             limit=limit,
@@ -176,34 +212,6 @@ class CodeNavigator:
                 break
             lines.append(entry)
         return "\n".join(lines)
-
-    def _fts_search(self, query: str, limit: int) -> list[SearchResult]:
-        terms = [term for term in query.replace('"', " ").split() if term]
-        if not terms or limit <= 0:
-            return []
-        fts_query = " OR ".join(f'"{term}"*' for term in terms[:8])
-        try:
-            with self._connect() as conn:
-                rows = conn.execute(
-                    """
-                    select path, name, signature, docstring from symbols_fts
-                    where root = ? and symbols_fts match ? limit ?
-                    """,
-                    (str(self.root), fts_query, limit),
-                ).fetchall()
-        except sqlite3.OperationalError:
-            return []
-        return [
-            SearchResult(
-                path=str(path),
-                start_line=0,
-                end_line=0,
-                snippet=str(signature or docstring or name),
-                reason="FTS5 symbol/docstring match",
-                symbol=str(name),
-            )
-            for path, name, signature, docstring in rows
-        ]
 
     def _replace_file(
         self,
@@ -245,21 +253,10 @@ class CodeNavigator:
                 """,
                 values,
             )
-            with self._suppress_fts_error():
-                conn.execute(
-                    "insert into symbols_fts(root, path, name, signature, docstring) "
-                    "values (?, ?, ?, ?, ?)",
-                    (str(self.root), symbol.path, symbol.name, symbol.signature, symbol.docstring),
-                )
 
     def _delete_file(self, conn: sqlite3.Connection, relative: str) -> None:
         conn.execute("delete from files where root = ? and path = ?", (str(self.root), relative))
         conn.execute("delete from symbols where root = ? and path = ?", (str(self.root), relative))
-        with self._suppress_fts_error():
-            conn.execute(
-                "delete from symbols_fts where root = ? and path = ?",
-                (str(self.root), relative),
-            )
 
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
@@ -280,11 +277,23 @@ class CodeNavigator:
                 create index if not exists idx_symbols_root_path on symbols(root, path);
                 """
             )
-            with self._suppress_fts_error():
-                conn.execute(
-                    "create virtual table if not exists symbols_fts using "
-                    "fts5(root UNINDEXED, path UNINDEXED, name, signature, docstring)"
-                )
+            legacy_fts = conn.execute(
+                "select 1 from sqlite_master where type = 'table' and name = 'symbols_fts'"
+            ).fetchone()
+            if legacy_fts:
+                conn.execute("drop table symbols_fts")
+
+    def _symbol_path_filter(self, path: str) -> tuple[str, list[object]]:
+        if path in {"", "."}:
+            return "", []
+        resolved = self._resolve(path)
+        if resolved == self.root:
+            return "", []
+        relative = str(resolved.relative_to(self.root))
+        if resolved.is_file():
+            return " and path = ?", [relative]
+        prefix = relative.rstrip("\\/") + os.sep
+        return " and (path = ? or substr(path, 1, ?) = ?)", [relative, len(prefix), prefix]
 
     def _resolve(self, value: str | Path) -> Path:
         candidate = Path(value)
@@ -296,9 +305,3 @@ class CodeNavigator:
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
-
-    @staticmethod
-    def _suppress_fts_error():
-        from contextlib import suppress
-
-        return suppress(sqlite3.OperationalError)

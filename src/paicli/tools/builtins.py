@@ -124,21 +124,6 @@ def get_builtin_tools() -> list[Tool]:
             handler=grep,
         ),
         Tool(
-            name="grep_code",
-            description="Alias of grep. Search text in workspace files.",
-            parameters=object_schema(
-                {
-                    "pattern": {"type": "string", "description": "Regex or plain text pattern"},
-                    "path": {"type": "string", "description": "Optional path to search"},
-                    "regex": {"type": "boolean", "description": "Treat pattern as regex"},
-                    "limit": {"type": "number", "description": "Maximum matches"},
-                },
-                ["pattern"],
-            ),
-            required_keys=["pattern"],
-            handler=grep,
-        ),
-        Tool(
             name="bash",
             description=_shell_tool_description(),
             parameters=object_schema(
@@ -226,14 +211,26 @@ def get_builtin_tools() -> list[Tool]:
         Tool(
             name="search_code",
             description=(
-                "Unified code navigation search across exact symbols, ripgrep text, and "
-                "FTS5 symbol/docstring data."
+                "Unified code navigation for exact definitions, ripgrep text, and symbol "
+                "references. Use repo_map first only when the project structure is unknown."
             ),
             parameters=object_schema(
                 {
                     "query": {"type": "string", "description": "Search query"},
-                    "mode": {"type": "string", "description": "auto, symbol, text, or semantic"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "symbol", "text", "references"],
+                        "description": "Navigation strategy; defaults to auto",
+                    },
                     "path": {"type": "string", "description": "Workspace path to search"},
+                    "kind": {
+                        "type": "string",
+                        "description": "Optional class/function/method filter for symbol mode",
+                    },
+                    "regex": {
+                        "type": "boolean",
+                        "description": "Treat query as regex in text mode",
+                    },
                     "limit": {"type": "number", "description": "Maximum matches"},
                 },
                 ["query"],
@@ -248,34 +245,6 @@ def get_builtin_tools() -> list[Tool]:
                 {"max_chars": {"type": "number", "description": "Maximum output characters"}}
             ),
             handler=repo_map,
-        ),
-        Tool(
-            name="find_symbol",
-            description="Find class, method, function, or interface definitions by exact name.",
-            parameters=object_schema(
-                {
-                    "name": {"type": "string", "description": "Exact symbol name"},
-                    "kind": {"type": "string", "description": "Optional symbol kind"},
-                    "limit": {"type": "number", "description": "Maximum results"},
-                },
-                ["name"],
-            ),
-            required_keys=["name"],
-            handler=find_symbol,
-        ),
-        Tool(
-            name="find_references",
-            description="Find references to a symbol using ripgrep word matching.",
-            parameters=object_schema(
-                {
-                    "name": {"type": "string", "description": "Symbol name"},
-                    "path": {"type": "string", "description": "Workspace path to search"},
-                    "limit": {"type": "number", "description": "Maximum results"},
-                },
-                ["name"],
-            ),
-            required_keys=["name"],
-            handler=find_references,
         ),
         Tool(
             name="document_symbols",
@@ -624,50 +593,23 @@ async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResul
 
 
 async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    results, truncated = _navigator(context).search(
-        str(payload["query"]),
-        mode=str(payload.get("mode") or "auto"),
-        path=str(payload.get("path") or "."),
-        limit=int(payload.get("limit") or 20),
-    )
+    try:
+        results, truncated = _navigator(context).search(
+            str(payload["query"]),
+            mode=str(payload.get("mode") or "auto"),
+            path=str(payload.get("path") or "."),
+            kind=str(payload.get("kind") or ""),
+            regex=bool(payload.get("regex", False)),
+            limit=int(payload.get("limit") or 20),
+        )
+    except (RuntimeError, ValueError, re.error) as exc:
+        return ToolResult(f"search_code failed: {exc}", is_error=True)
     return ToolResult(_search_result_json(results, truncated=truncated))
 
 
 async def repo_map(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     max_chars = max(1000, min(int(payload.get("max_chars") or 12_000), 20_000))
     return ToolResult(_navigator(context).repo_map(max_chars=max_chars))
-
-
-async def find_symbol(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    symbols = _navigator(context).find_symbol(
-        str(payload["name"]),
-        kind=str(payload.get("kind") or ""),
-        limit=int(payload.get("limit") or 20),
-    )
-    rows = [
-        {
-            "path": item.path,
-            "name": item.name,
-            "kind": item.kind,
-            "parent_name": item.parent_name,
-            "signature": item.signature,
-            "start_line": item.start_line,
-            "end_line": item.end_line,
-            "docstring": item.docstring,
-            "file_version": f"sha256:{item.file_version}",
-        }
-        for item in symbols
-    ]
-    return ToolResult(json.dumps({"symbols": rows}, ensure_ascii=False, indent=2))
-
-
-async def find_references(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    results, truncated = _navigator(context).find_references(
-        str(payload["name"]),
-        path=str(payload.get("path") or "."),
-        limit=int(payload.get("limit") or 50),
-    )
-    return ToolResult(_search_result_json(results, truncated=truncated))
 
 
 async def document_symbols(payload: dict[str, Any], context: ToolContext) -> ToolResult:

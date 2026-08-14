@@ -32,7 +32,7 @@ SmartCLI 是一个为了深入学习和探索 AI Agent 核心机制而开发的�
 - Chrome DevTools MCP 配置助手
 - SmartCLI 自身也可以作为 MCP server 暴露内置工具
 - Runtime API，支持线程、turn、事件日志和持久化后台任务
-- Agentic Code Navigation：ripgrep、Repo Map、符号/FTS5 索引、引用查找、上下文去重与增量刷新
+- Agentic Code Navigation：Repo Map、统一代码搜索、符号索引、引用查找、上下文去重与增量刷新
 - Plan/Team 运行状态原子持久化，预算耗尽后可从 `.paicli/runs` 断点续跑
 - Agent run 前后自动创建快照，支持恢复现场
 - 支持本地图片和远程图片输入，并根据模型能力自动降级
@@ -118,7 +118,7 @@ PAICLI_API_KEY=your_key_here
 
 ### 智能代码导航
 
-`search_code` 是统一入口：已知符号优先命中函数、类和方法索引，普通关键词使用 ripgrep，概念查询再由 SQLite FTS5 兜底。`repo_map` 提供小型项目地图，`find_symbol`、`find_references` 和 `document_symbols` 用于逐步缩小代码范围，最终仍以 `read_file` 读取的实时源码为准。索引用文件 SHA-256 做增量判断，并在 `write_file` 或 Shell 修改成功后通过 Post Tool Hook 自动刷新；`ContextLedger` 会阻止相同文件版本与行区间被重复注入上下文。
+代码导航分为三层：项目结构未知时使用 `repo_map` 生成小型项目地图；随后通过统一的 `search_code` 入口按 `auto`、`symbol`、`text` 或 `references` 模式查找定义、源码文本和可能的引用；已知文件路径后使用 `document_symbols` 展开文件结构，并以 `read_file` 读取的实时源码为准。符号索引用文件 SHA-256 做增量判断，并在 `write_file` 或 Shell 修改成功后通过 Post Tool Hook 自动刷新；`ContextLedger` 会阻止相同文件版本与行区间被重复注入上下文。
 
 模型服务连接失败、超时或返回 HTTP 错误时，终端仅显示可操作的错误提示，不展开内部堆栈；当前消息和已有工具上下文会保留，连接恢复后可直接输入“继续”。
 
@@ -185,8 +185,8 @@ uv run smartcli -p "解释这个仓库"
 /hitl on|off|always|auto|never
 /policy
 /audit [N]
-/index [path]              # incrementally refresh SHA-256/symbol/FTS5 index
-/search <query>            # symbol + ripgrep + FTS5 navigation search
+/index [path]              # incrementally refresh SHA-256/symbol index
+/search <query>            # exact symbol + ripgrep navigation search
 /plan <task>
 /team <task>
 /model
@@ -214,13 +214,15 @@ SmartCLI 内置了一组 Agent 可以调用的本地工具和联网工具：
 - `write_file`
 - `list_dir`
 - `glob` / `glob_files`
-- `grep` / `grep_code`
+- `grep`
 - `bash` / `execute_command`
 - `web_search`
 - `web_fetch`
 - `save_memory`
 - `load_skill`
 - `search_code`
+- `repo_map`
+- `document_symbols`
 - `revert_turn`
 
 写文件、执行命令、远程 MCP 写操作、恢复快照等危险动作，会经过 policy、HITL 和 audit 处理。
