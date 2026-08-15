@@ -39,6 +39,11 @@ class PlainRenderer:
                 f"+{event.get('additional_tokens') or 0} tokens; context preserved.\n"
             )
             sys.stdout.flush()
+        elif event_type == "context_compressed":
+            before = float(event.get("before_pressure") or 0.0)
+            after = float(event.get("after_pressure") or 0.0)
+            sys.stdout.write(f"\n[context-compressed] {before:.0%} -> {after:.0%}\n")
+            sys.stdout.flush()
         elif event_type == "error":
             message = str(event.get("message") or event.get("error") or "Unknown error")
             sys.stdout.write(f"\n[error:context-preserved] {message}\n")

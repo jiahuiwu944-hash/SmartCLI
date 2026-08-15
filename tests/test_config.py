@@ -75,3 +75,22 @@ def test_agent_safety_budgets_can_be_configured_from_env(tmp_path, monkeypatch):
     assert config.agent.stop_hook_max_retries == 4
     assert config.agent.budget_extension_turns == 25
     assert config.agent.budget_extension_tokens == 150000
+
+
+def test_short_term_context_can_be_configured_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PAICLI_SHORT_TERM_MEMORY", "false")
+    monkeypatch.setenv("PAICLI_CONTEXT_WARNING_THRESHOLD", "0.6")
+    monkeypatch.setenv("PAICLI_CONTEXT_COMPRESSION_THRESHOLD", "0.75")
+    monkeypatch.setenv("PAICLI_CONTEXT_TARGET_MIN", "0.45")
+    monkeypatch.setenv("PAICLI_CONTEXT_TARGET_MAX", "0.55")
+    monkeypatch.setenv("PAICLI_CONTEXT_EMERGENCY_TARGET", "0.4")
+
+    config = load_config(project_root=tmp_path)
+
+    assert config.memory.short_term_enabled is False
+    assert config.memory.warning_threshold == 0.6
+    assert config.memory.compression_threshold == 0.75
+    assert config.memory.target_pressure_min == 0.45
+    assert config.memory.target_pressure_max == 0.55
+    assert config.memory.emergency_target == 0.4

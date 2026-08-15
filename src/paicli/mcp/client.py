@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -195,7 +196,7 @@ class McpClientManager:
             if not spec.command:
                 raise ValueError(f"MCP server {spec.name} is missing command")
             params = StdioServerParameters(
-                command=spec.command,
+                command=_stdio_command(spec.command),
                 args=spec.args,
                 env={**os.environ, **spec.env},
                 cwd=spec.cwd or self.project_root,
@@ -242,3 +243,10 @@ def _content_to_text(content: Any) -> str:
     if hasattr(content, "model_dump"):
         return json.dumps(content.model_dump(mode="json"), ensure_ascii=False)
     return str(content)
+
+
+def _stdio_command(command: str) -> str:
+    """Keep Python MCP servers in SmartCLI's active virtual environment."""
+    if command.lower() in {"python", "python3", "python.exe"}:
+        return sys.executable
+    return command

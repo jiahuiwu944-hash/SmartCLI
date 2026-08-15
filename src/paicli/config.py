@@ -64,7 +64,18 @@ class MemoryConfig:
     long_term_enabled: bool = True
     long_term_db_path: str = "~/.paicli/memory.db"
     token_budget_mode: str = "balanced"
+    short_term_enabled: bool = True
+    warning_threshold: float = 0.65
     compression_threshold: float = 0.8
+    target_pressure_min: float = 0.5
+    target_pressure_max: float = 0.6
+    emergency_target: float = 0.45
+    recent_turns_to_keep: int = 4
+    tool_reserve_min: int = 4096
+    tool_reserve_max_ratio: float = 0.15
+    safety_margin_ratio: float = 0.03
+    summary_max_tokens: int = 1200
+    emergency_retry_limit: int = 1
 
 
 @dataclass(slots=True)
@@ -202,6 +213,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     llm = result.setdefault("llm", {})
     agent = result.setdefault("agent", {})
     features = result.setdefault("features", {})
+    memory = result.setdefault("memory", {})
     policy = result.setdefault("policy", {})
     tools = result.setdefault("tools", {})
 
@@ -247,6 +259,20 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 tools[config_key] = caster(raw)
+
+    memory_mappings: list[tuple[str, str, Any]] = [
+        ("PAICLI_SHORT_TERM_MEMORY", "short_term_enabled", _parse_bool),
+        ("PAICLI_CONTEXT_WARNING_THRESHOLD", "warning_threshold", float),
+        ("PAICLI_CONTEXT_COMPRESSION_THRESHOLD", "compression_threshold", float),
+        ("PAICLI_CONTEXT_TARGET_MIN", "target_pressure_min", float),
+        ("PAICLI_CONTEXT_TARGET_MAX", "target_pressure_max", float),
+        ("PAICLI_CONTEXT_EMERGENCY_TARGET", "emergency_target", float),
+    ]
+    for env_key, config_key, caster in memory_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                memory[config_key] = caster(raw)
 
     provider = str(llm.get("provider") or "").lower()
     if not llm.get("api_key"):

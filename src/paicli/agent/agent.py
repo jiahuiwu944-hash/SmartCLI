@@ -5,6 +5,7 @@ from contextlib import suppress
 from typing import Any
 
 from paicli.config import PaiCliConfig
+from paicli.context import ContextRuntime
 from paicli.llm.base import LlmClient
 from paicli.skill import SkillContextBuffer
 from paicli.snapshot import SnapshotService
@@ -42,6 +43,7 @@ class Agent:
         self.max_turns = max_turns if max_turns is not None else config.agent.max_turns
         self.history: list[Message] = []
         self.skill_context_buffer = SkillContextBuffer()
+        self.context_runtime = ContextRuntime(llm_client, config)
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
         snapshot = SnapshotService(self.cwd)
@@ -61,6 +63,7 @@ class Agent:
                 stop_hook_callback=self.stop_hook_callback,
                 tool_hook_manager=self.tool_hook_manager,
                 skill_context_buffer=self.skill_context_buffer,
+                context_runtime=self.context_runtime,
                 max_turns=self.max_turns,
             ):
                 if event.get("type") in {"done", "error"} and event.get("messages"):
@@ -97,3 +100,4 @@ class Agent:
     def clear_history(self) -> None:
         self.history = []
         self.skill_context_buffer.clear()
+        self.context_runtime.reset()

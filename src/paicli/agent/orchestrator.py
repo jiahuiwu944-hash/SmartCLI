@@ -12,6 +12,7 @@ from typing import Any
 from paicli.agent.query import query
 from paicli.agent.verifier import CompletionVerifier
 from paicli.config import PaiCliConfig
+from paicli.context import ContextRuntime
 from paicli.llm.base import LlmClient
 from paicli.prompt import PromptAssembler
 from paicli.runtime.budget import BudgetManager
@@ -115,6 +116,7 @@ class SubAgent:
         self.tool_hook_manager = tool_hook_manager
         self.skill_context_buffer = skill_context_buffer or SkillContextBuffer()
         self.history: list[Message] = []
+        self.context_runtime = ContextRuntime(llm_client, config)
 
     async def execute(self, task: AgentMessage, context: str = "") -> AgentMessage:
         content = f"{context}\n\nCurrent task:\n{task.content}".strip() if context else task.content
@@ -132,6 +134,7 @@ class SubAgent:
 
     def clear_history(self) -> None:
         self.history = []
+        self.context_runtime.reset()
 
     async def _execute_worker(self, content: str) -> AgentMessage:
         text = ""
@@ -152,6 +155,7 @@ class SubAgent:
                 approval_callback=self.approval_callback,
                 tool_hook_manager=self.tool_hook_manager,
                 skill_context_buffer=self.skill_context_buffer,
+                context_runtime=self.context_runtime,
                 max_turns=8,
                 stop_hook_enabled=False,
             ):
@@ -185,11 +189,21 @@ class SubAgent:
         text = ""
         tokens = 0
         messages = [*self.history, Message(role="user", content=content)]
+        protected_message = messages[-1]
+        system_prompt = self._system_prompt()
         try:
+            prepared = await self.context_runtime.prepare(
+                system_prompt=system_prompt,
+                messages=messages,
+                tools=[],
+                protected_message=protected_message,
+            )
+            messages = prepared.messages
+            tokens += prepared.internal_input_tokens + prepared.internal_output_tokens
             async for event in self.llm_client.chat(
                 messages,
                 [],
-                system_prompt=self._system_prompt(),
+                system_prompt=system_prompt,
             ):
                 if event.get("type") == "text_delta":
                     text += str(event.get("text") or "")
@@ -197,6 +211,10 @@ class SubAgent:
                     usage = event.get("usage") or {}
                     tokens += int(usage.get("input_tokens") or 0)
                     tokens += int(usage.get("output_tokens") or 0)
+                    self.context_runtime.observe_usage(
+                        int(usage.get("input_tokens") or 0),
+                        prepared.estimated_input_tokens,
+                    )
                 elif event.get("type") == "error":
                     raise event["error"]
         except Exception as exc:  # noqa: BLE001

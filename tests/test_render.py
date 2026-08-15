@@ -105,6 +105,41 @@ def test_text_deltas_render_as_markdown_on_turn_complete():
     assert stats["has_usage"] is True
 
 
+def test_context_usage_drives_toolbar_and_compression_is_concise():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console, context_window=1000)
+
+    renderer.handle(
+        {
+            "type": "context_usage",
+            "estimated_input_tokens": 500,
+            "context_window": 1000,
+            "output_reserve": 100,
+            "tool_reserve": 50,
+            "safety_margin": 50,
+            "pressure_ratio": 0.7,
+            "target_ratio": 0.55,
+        }
+    )
+    renderer.handle(
+        {
+            "type": "context_compressed",
+            "before_pressure": 0.84,
+            "after_pressure": 0.56,
+            "compacted_tool_results": 2,
+            "summarized_messages": 6,
+        }
+    )
+    renderer.handle({"type": "done", "total_turns": 1, "total_tokens": 0})
+
+    stats = renderer.toolbar_status()
+    assert stats["context_ratio"] == 0.7
+    assert stats["estimated_input_tokens"] == 500
+    assert stats["output_reserve"] == 100
+    assert "Context compressed (automatic): 84% -> 56%" in stream.getvalue()
+
+
 def test_interleaved_thinking_does_not_repeat_assistant_output_panels():
     stream = StringIO()
     console = Console(file=stream, color_system=None, width=120)

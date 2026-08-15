@@ -1,8 +1,29 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import Any
 
 import httpx
+
+
+def is_context_length_error(error: Any) -> bool:
+    """Return whether the provider rejected a request because its context was too large."""
+    status = 0
+    detail = str(error).lower()
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        with suppress(Exception):
+            detail += " " + error.response.text.lower()
+    markers = (
+        "context length",
+        "context_length",
+        "maximum context",
+        "max context",
+        "too many tokens",
+        "token limit",
+        "request too large",
+    )
+    return status in {400, 413, 422} and any(marker in detail for marker in markers)
 
 
 def friendly_llm_error(error: Any, *, source: str = "model") -> str:

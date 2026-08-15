@@ -35,6 +35,8 @@ class RichRenderer:
         self._last_total_tokens = 0
         self._last_context_ratio = 0.0
         self._last_has_usage = False
+        self._has_context_estimate = False
+        self._context_details: dict[str, Any] = {}
 
     def set_context_window(self, context_window: int | None) -> None:
         self._context_window = context_window or self._context_window
@@ -47,6 +49,7 @@ class RichRenderer:
         self._input_tokens = 0
         self._output_tokens = 0
         self._last_input_tokens = 0
+        self._has_context_estimate = False
 
     def toolbar_status(self) -> dict[str, Any]:
         return {
@@ -56,6 +59,7 @@ class RichRenderer:
             "total_tokens": self._last_total_tokens,
             "context_ratio": self._last_context_ratio,
             "has_usage": self._last_has_usage,
+            **self._context_details,
         }
 
     def banner(
@@ -101,6 +105,10 @@ class RichRenderer:
             self._update_live_thinking()
         elif event_type == "usage":
             self._record_usage(event.get("usage") or {})
+        elif event_type == "context_usage":
+            self._record_context_usage(event)
+        elif event_type == "context_compressed":
+            self._print_context_compressed(event)
         elif event_type == "turn_complete":
             stop_reason = str(event.get("stop_reason") or "end_turn")
             title = "Assistant Output" if stop_reason == "tool_use" else "Final Output"
@@ -255,6 +263,32 @@ class RichRenderer:
         if input_tokens:
             self._last_input_tokens = input_tokens
 
+    def _record_context_usage(self, event: dict[str, Any]) -> None:
+        self._last_context_ratio = float(event.get("pressure_ratio") or 0.0)
+        self._last_has_usage = True
+        self._has_context_estimate = True
+        self._context_details = {
+            "estimated_input_tokens": int(event.get("estimated_input_tokens") or 0),
+            "context_window": int(event.get("context_window") or self._context_window),
+            "output_reserve": int(event.get("output_reserve") or 0),
+            "tool_reserve": int(event.get("tool_reserve") or 0),
+            "safety_margin": int(event.get("safety_margin") or 0),
+            "target_ratio": float(event.get("target_ratio") or 0.0),
+            "pressure_level": str(event.get("pressure_level") or "normal"),
+        }
+
+    def _print_context_compressed(self, event: dict[str, Any]) -> None:
+        before = float(event.get("before_pressure") or 0.0)
+        after = float(event.get("after_pressure") or 0.0)
+        tools = int(event.get("compacted_tool_results") or 0)
+        messages = int(event.get("summarized_messages") or 0)
+        mode = "emergency" if event.get("emergency") else "automatic"
+        self.console.print(
+            f"[yellow]Context compressed ({mode}):[/yellow] "
+            f"{before:.0%} -> {after:.0%}; {tools} tool results slimmed, "
+            f"{messages} messages summarized."
+        )
+
     def _print_tool_call(self, event: dict[str, Any]) -> None:
         name = str(event.get("name") or "unknown")
         payload = event.get("input") or {}
@@ -323,7 +357,7 @@ class RichRenderer:
         self.console.print(
             _output_panel(
                 feedback,
-                title=Text(f"Stop Hook 路 {status}", style=f"bold {color}"),
+                title=Text(f"Stop Hook · {status}", style=f"bold {color}"),
                 border_style=color,
             )
         )
@@ -334,7 +368,7 @@ class RichRenderer:
         self.console.print(
             _output_panel(
                 message,
-                title=Text(f"Agent Correction 路 {reason}", style="bold #c084fc"),
+                title=Text(f"Agent Correction · {reason}", style="bold #c084fc"),
                 border_style="#6d28d9",
             )
         )
@@ -355,9 +389,13 @@ class RichRenderer:
         total_tokens = int(event.get("total_tokens") or self._input_tokens + self._output_tokens)
         turns = int(event.get("total_turns") or 0)
         has_usage = total_tokens > 0 or self._input_tokens > 0 or self._output_tokens > 0
-        context_ratio = (
-            self._last_input_tokens / self._context_window if self._context_window > 0 else 0
-        )
+        context_ratio = self._last_context_ratio
+        if not self._has_context_estimate:
+            context_ratio = (
+                self._last_input_tokens / self._context_window
+                if self._context_window > 0
+                else 0
+            )
         self._last_turns = turns
         self._last_total_tokens = total_tokens
         self._last_context_ratio = context_ratio

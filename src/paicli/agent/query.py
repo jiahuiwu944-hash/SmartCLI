@@ -9,9 +9,10 @@ from typing import Any
 from paicli.agent.stop_hook import StopHookResult, verify_answer
 from paicli.codeintel import CodeNavigator, ContextLedger
 from paicli.config import PaiCliConfig
+from paicli.context import ContextRuntime
 from paicli.image import parse_image_references
 from paicli.llm.base import LlmClient
-from paicli.llm.errors import friendly_llm_error, llm_error_event
+from paicli.llm.errors import friendly_llm_error, is_context_length_error, llm_error_event
 from paicli.tools.base import ToolContext
 from paicli.tools.executor import ToolExecutor
 from paicli.tools.hooks import ToolHookManager
@@ -33,15 +34,16 @@ async def query(
     stop_hook_callback=None,
     tool_hook_manager: ToolHookManager | None = None,
     skill_context_buffer=None,
+    context_runtime: ContextRuntime | None = None,
     max_turns: int | None = None,
     stop_hook_enabled: bool | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     original_request = user_message
     user_message = _prepend_skill_context(user_message, skill_context_buffer)
-    messages = [
-        *(history or []),
-        Message(role="user", content=parse_image_references(user_message, cwd)),
-    ]
+    current_user_message = Message(
+        role="user", content=parse_image_references(user_message, cwd)
+    )
+    messages = [*(history or []), current_user_message]
     tool_definitions = tool_registry.definitions()
     executor = ToolExecutor(tool_registry, tool_hook_manager)
     context = ToolContext(
@@ -79,6 +81,8 @@ async def query(
     stop_hook_retries = 0
     termination_reason = "completed"
     termination_message = ""
+    runtime = context_runtime or ContextRuntime(llm_client, config)
+    emergency_context_retries = 0
 
     while True:
         reached_budgets = _reached_budgets(
@@ -141,6 +145,27 @@ async def query(
             )
             break
 
+        prepared = await runtime.prepare(
+            system_prompt=system_prompt,
+            messages=messages,
+            tools=tool_definitions,
+            protected_message=current_user_message,
+        )
+        messages = prepared.messages
+        total_tokens += prepared.internal_input_tokens + prepared.internal_output_tokens
+        if prepared.internal_input_tokens or prepared.internal_output_tokens:
+            yield {
+                "type": "usage",
+                "usage": {
+                    "input_tokens": prepared.internal_input_tokens,
+                    "output_tokens": prepared.internal_output_tokens,
+                },
+                "source": "context_compression",
+            }
+        if prepared.compressed:
+            yield prepared.compression_event()
+        yield prepared.event()
+
         turn += 1
         text = ""
         thinking = ""
@@ -184,6 +209,37 @@ async def query(
 
         if stream_error is not None:
             total_tokens += usage_input + usage_output
+            if (
+                runtime.enabled
+                and not text
+                and not tool_states
+                and emergency_context_retries
+                < max(0, int(config.memory.emergency_retry_limit))
+                and is_context_length_error(stream_error)
+            ):
+                emergency_context_retries += 1
+                emergency = await runtime.prepare(
+                    system_prompt=system_prompt,
+                    messages=messages,
+                    tools=tool_definitions,
+                    protected_message=current_user_message,
+                    emergency=True,
+                )
+                messages = emergency.messages
+                total_tokens += emergency.internal_input_tokens + emergency.internal_output_tokens
+                if emergency.internal_input_tokens or emergency.internal_output_tokens:
+                    yield {
+                        "type": "usage",
+                        "usage": {
+                            "input_tokens": emergency.internal_input_tokens,
+                            "output_tokens": emergency.internal_output_tokens,
+                        },
+                        "source": "context_compression",
+                    }
+                yield emergency.compression_event()
+                yield emergency.event()
+                turn -= 1
+                continue
             if text:
                 messages.append(
                     Message(
@@ -206,6 +262,7 @@ async def query(
             return
 
         total_tokens += usage_input + usage_output
+        runtime.observe_usage(usage_input, prepared.estimated_input_tokens)
         tool_calls = _finalize_tool_calls(tool_states)
         assistant_message = Message(role="assistant", content=text, tool_calls=tool_calls)
         if thinking and text:
@@ -393,6 +450,7 @@ async def query(
 
         tool_results = await executor.execute_all(tool_calls, context)
         for result in tool_results:
+            runtime.observe_tool_result(result.content)
             yield {
                 "type": "tool_result",
                 "name": _tool_name_by_id(tool_calls, result.tool_use_id or ""),
