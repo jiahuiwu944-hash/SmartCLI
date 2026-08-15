@@ -471,7 +471,11 @@ class ApprovingReviewClient:
     provider_name = "fake-provider"
     max_context_window = 1000
 
+    def __init__(self):
+        self.payload = ""
+
     async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        self.payload = str(messages[0].content)
         yield {"type": "text_delta", "text": '{"approved": true, "feedback": ""}'}
         yield {"type": "message_end", "stop_reason": "end_turn"}
 
@@ -487,6 +491,130 @@ def test_stop_hook_allows_honest_partial_completion_after_a_block():
     )
 
     assert result.approved is True
+
+
+def test_stop_hook_does_not_treat_words_inside_source_as_a_runtime_guard():
+    messages = [
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "source_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"stop_hook.py"}',
+                    },
+                }
+            ],
+        ),
+        Message(
+            role="tool",
+            tool_call_id="source_read",
+            content=(
+                "[FILE_CONTENT]\n"
+                'markers = ("tool call was blocked", "calls were not executed again")'
+            ),
+        ),
+    ]
+
+    result = asyncio.run(
+        verify_answer(
+            llm_client=ApprovingReviewClient(),
+            original_request="Explain the source code.",
+            proposed_answer="The source defines guard-message markers.",
+            messages=messages,
+        )
+    )
+
+    assert result.approved is True
+
+
+def test_stop_hook_evidence_summarizes_successful_read_file_coverage():
+    client = ApprovingReviewClient()
+    messages = [
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "read_range",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"README.md","offset":101,"limit":2}',
+                    },
+                }
+            ],
+        ),
+        Message(
+            role="tool",
+            tool_call_id="read_range",
+            content=(
+                "[FILE_METADATA]\n"
+                "path: README.md\n"
+                "version: sha256:abc\n"
+                "size: 5000\n"
+                "[FILE_CONTENT]\n"
+                "101: first line\n"
+                "102: second line\n"
+            ),
+        ),
+    ]
+
+    result = asyncio.run(
+        verify_answer(
+            llm_client=client,
+            original_request="Inspect these lines.",
+            proposed_answer="The requested range was inspected.",
+            messages=messages,
+        )
+    )
+
+    assert result.approved is True
+    assert "read_succeeded path=README.md" in client.payload
+    assert "returned_lines=101-102" in client.payload
+    assert "version=sha256:abc" in client.payload
+
+
+class AlwaysRejectingStopHookClient:
+    model_name = "fake-model"
+    provider_name = "fake-provider"
+    max_context_window = 1000
+
+    def __init__(self):
+        self.main_calls = 0
+
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        if "Stop Hook reviewer" in system_prompt:
+            yield {
+                "type": "text_delta",
+                "text": '{"approved": false, "feedback": "Need more evidence."}',
+            }
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+            return
+        self.main_calls += 1
+        yield {"type": "text_delta", "text": f"candidate answer {self.main_calls}"}
+        yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+def test_stop_hook_exhaustion_does_not_promote_rejected_draft(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = load_config(project_root=tmp_path)
+    config.agent.max_total_tokens = 0
+    config.agent.stop_hook_max_retries = 1
+
+    events = asyncio.run(
+        _collect_events(_engine(tmp_path, config, AlwaysRejectingStopHookClient()))
+    )
+
+    stopped = next(event for event in events if event["type"] == "run_stopped")
+    done = next(event for event in events if event["type"] == "done")
+    assert not any(event["type"] == "answer_preserved" for event in events)
+    assert stopped["reason"] == "stop_hook_retries_exhausted"
+    assert "No unverified draft was shown" in stopped["message"]
+    assert done["completed"] is False
 
 
 def _blocked_tool_messages() -> list[Message]:

@@ -19,6 +19,9 @@ Apply these rules strictly:
    that one step was blocked or not executed.
 4. Reject unsupported claims, ignored errors, incomplete requirements, and code-changing
    tasks without appropriate verification evidence.
+5. A successful read_file evidence row includes the exact returned line range. Treat that
+   range as proof that the agent inspected it; the full source body is intentionally omitted
+   from the reviewer payload and must not be demanded again.
 
 Give concrete feedback that tells the agent what to inspect, change, clarify, or test next.
 Do not solve the task yourself and do not approve merely because the answer sounds plausible.
@@ -113,29 +116,95 @@ def _parse_verdict(text: str) -> tuple[bool, str]:
 
 
 def _recent_tool_evidence(messages: list[Message], *, max_chars: int = 12_000) -> str:
-    rows: list[str] = []
-    for message in reversed(messages):
+    entries: list[dict[str, str]] = []
+    entries_by_id: dict[str, dict[str, str]] = {}
+    for message in messages:
         if message.role == "assistant" and message.tool_calls:
-            for call in reversed(message.tool_calls):
+            for call in message.tool_calls:
                 function = call.get("function") or {}
-                rows.append(
-                    "TOOL CALL "
-                    f"id={call.get('id') or '?'} name={function.get('name') or 'unknown'} "
-                    f"arguments={function.get('arguments') or '{}'}"
-                )
+                call_id = str(call.get("id") or "?")
+                entry = {
+                    "id": call_id,
+                    "name": str(function.get("name") or "unknown"),
+                    "arguments": str(function.get("arguments") or "{}"),
+                    "status": "missing_result",
+                    "result": "",
+                }
+                entries.append(entry)
+                entries_by_id[call_id] = entry
         elif message.role == "tool":
             content = (
                 message.content
                 if isinstance(message.content, str)
                 else json.dumps(message.content, ensure_ascii=False)
             )
-            status = "blocked" if _is_guard_result(content) else "returned"
-            rows.append(f"TOOL RESULT id={message.tool_call_id or '?'} status={status}\n{content}")
-        else:
-            continue
-        if sum(len(row) for row in rows) >= max_chars:
+            call_id = str(message.tool_call_id or "?")
+            entry = entries_by_id.get(call_id)
+            if entry is None:
+                entry = {
+                    "id": call_id,
+                    "name": "unknown",
+                    "arguments": "{}",
+                    "status": "missing_result",
+                    "result": "",
+                }
+                entries.append(entry)
+                entries_by_id[call_id] = entry
+            entry["status"] = "blocked" if _is_guard_result(content) else "returned"
+            entry["result"] = content
+
+    rows = [_format_evidence_entry(entry) for entry in entries]
+    selected: list[str] = []
+    used_chars = 0
+    for row in reversed(rows):
+        if selected and used_chars + len(row) > max_chars:
             break
-    return "\n\n---\n\n".join(reversed(rows))[-max_chars:]
+        selected.append(row)
+        used_chars += len(row)
+    return "\n\n---\n\n".join(reversed(selected))
+
+
+def _format_evidence_entry(entry: dict[str, str]) -> str:
+    result = _summarize_tool_result(
+        entry["name"],
+        entry["arguments"],
+        entry["result"],
+    )
+    return (
+        f"TOOL EVIDENCE id={entry['id']} name={entry['name']} "
+        f"status={entry['status']} arguments={entry['arguments']}\n{result}"
+    )
+
+
+def _summarize_tool_result(name: str, arguments: str, content: str) -> str:
+    if name == "read_file" and content:
+        path_match = re.search(r"(?m)^path:\s*(.+?)\s*$", content)
+        version_match = re.search(r"(?m)^version:\s*(.+?)\s*$", content)
+        size_match = re.search(r"(?m)^size:\s*(\d+)\s*$", content)
+        line_numbers = [
+            int(value) for value in re.findall(r"(?m)^\s*(\d+)\s*:\s", content)
+        ]
+        try:
+            parsed_arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            parsed_arguments = {}
+        path = (
+            path_match.group(1)
+            if path_match
+            else str(parsed_arguments.get("path") or "unknown")
+        )
+        fields = [f"read_succeeded path={path}"]
+        if line_numbers:
+            fields.append(f"returned_lines={min(line_numbers)}-{max(line_numbers)}")
+        if size_match:
+            fields.append(f"file_size={size_match.group(1)}")
+        if version_match:
+            fields.append(f"version={version_match.group(1)}")
+        return " ".join(fields)
+
+    if len(content) <= 900:
+        return content
+    return content[:620] + "\n... [result summarized] ...\n" + content[-220:]
 
 
 def _deterministic_contradiction(answer: str, messages: list[Message]) -> str:
@@ -178,12 +247,7 @@ def _deterministic_contradiction(answer: str, messages: list[Message]) -> str:
 
 
 def _is_guard_result(content: str) -> bool:
-    normalized = content.strip().lower()
-    return normalized.startswith("smartcli safety guard:") or any(
-        marker in normalized
-        for marker in (
-            "pending tool calls were not executed",
-            "calls were not executed again",
-            "tool call was blocked",
-        )
-    )
+    # Runtime-generated guard results always use this explicit prefix.  Do not scan
+    # arbitrary tool output for phrases such as "tool call was blocked": a user may
+    # legitimately read source code, tests, or documentation containing those words.
+    return content.strip().lower().startswith("smartcli safety guard:")

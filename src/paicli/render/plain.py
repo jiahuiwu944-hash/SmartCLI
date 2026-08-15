@@ -25,6 +25,14 @@ class PlainRenderer:
             message = str(event.get("message") or "Agent run stopped")
             sys.stdout.write(f"\n[stopped:{reason}] {message}\n")
             sys.stdout.flush()
+        elif event_type == "answer_preserved":
+            text = str(event.get("text") or "").strip()
+            if text:
+                sys.stdout.write(
+                    "\n[best-available-answer:verification-incomplete]\n"
+                    f"{text}\n"
+                )
+                sys.stdout.flush()
         elif event_type == "stop_hook_review":
             status = "approved" if event.get("approved") else "revision-required"
             sys.stdout.write(f"\n[stop-hook:{status}] {event.get('feedback') or ''}\n")

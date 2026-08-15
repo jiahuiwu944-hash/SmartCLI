@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from rich import box
@@ -20,10 +21,13 @@ class RichRenderer:
         *,
         live_markdown: bool = False,
         context_window: int | None = None,
+        show_thinking: bool = False,
     ):
         self.console = console or Console()
         self._buffer: list[str] = []
         self._thinking_buffer: list[str] = []
+        self._pending_answer = ""
+        self._show_thinking = show_thinking
         self._live_markdown = live_markdown
         self._live: Live | None = None
         self._thinking_live: Live | None = None
@@ -44,6 +48,7 @@ class RichRenderer:
     def start_run(self) -> None:
         self._buffer.clear()
         self._thinking_buffer.clear()
+        self._pending_answer = ""
         self._stop_live_markdown()
         self._stop_live_thinking()
         self._input_tokens = 0
@@ -100,9 +105,10 @@ class RichRenderer:
             self._buffer.append(text)
             self._update_live_markdown()
         elif event_type == "thinking_delta":
-            thinking = str(event.get("thinking") or "")
-            self._thinking_buffer.append(thinking)
-            self._update_live_thinking()
+            if self._show_thinking:
+                thinking = str(event.get("thinking") or "")
+                self._thinking_buffer.append(thinking)
+                self._update_live_thinking()
         elif event_type == "usage":
             self._record_usage(event.get("usage") or {})
         elif event_type == "context_usage":
@@ -111,9 +117,13 @@ class RichRenderer:
             self._print_context_compressed(event)
         elif event_type == "turn_complete":
             stop_reason = str(event.get("stop_reason") or "end_turn")
-            title = "Assistant Output" if stop_reason == "tool_use" else "Final Output"
             self._flush_thinking()
-            self._flush_markdown(title=title)
+            if stop_reason == "tool_use":
+                self._discard_markdown()
+            elif event.get("verification_pending"):
+                self._hold_answer_for_verification()
+            else:
+                self._flush_markdown(title="Final Output")
         elif event_type == "tool_call":
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
@@ -124,8 +134,12 @@ class RichRenderer:
             self._print_tool_result(event)
         elif event_type == "stop_hook_review":
             self._flush_thinking()
-            self._flush_markdown(title="Assistant Output")
+            self._discard_markdown()
             self._print_stop_hook_review(event)
+            if event.get("approved"):
+                self._flush_pending_answer()
+            else:
+                self._pending_answer = ""
         elif event_type == "model_redirected":
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
@@ -139,6 +153,11 @@ class RichRenderer:
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
             self._print_run_stopped(event)
+        elif event_type == "answer_preserved":
+            self._flush_thinking()
+            self._flush_markdown(title="Assistant Output")
+            self._pending_answer = ""
+            self._print_preserved_answer(event)
         elif event_type == "llm_retry":
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
@@ -156,6 +175,7 @@ class RichRenderer:
             )
         elif event_type == "done":
             self._flush_thinking()
+            self._flush_pending_answer()
             self._flush_markdown(title="Final Output")
             self._record_run_summary(event)
 
@@ -178,6 +198,28 @@ class RichRenderer:
                 _output_panel(
                     Markdown(text),
                     title=Text(title, style="bold #a8ff60"),
+                    border_style="#3f3f46",
+                )
+            )
+
+    def _discard_markdown(self) -> None:
+        """Hide transitory narration such as 'I will inspect the file' before tool use."""
+        self._buffer.clear()
+        self._stop_live_markdown()
+
+    def _hold_answer_for_verification(self) -> None:
+        self._pending_answer = "".join(self._buffer).strip()
+        self._buffer.clear()
+        self._stop_live_markdown()
+
+    def _flush_pending_answer(self) -> None:
+        text = self._pending_answer.strip()
+        self._pending_answer = ""
+        if text:
+            self.console.print(
+                _output_panel(
+                    Markdown(text),
+                    title=Text("Final Output", style="bold #a8ff60"),
                     border_style="#3f3f46",
                 )
             )
@@ -308,9 +350,11 @@ class RichRenderer:
     def _print_tool_result(self, event: dict[str, Any]) -> None:
         is_error = bool(event.get("is_error"))
         name = str(event.get("name") or "unknown")
-        result = str(event.get("result") or "")
-        if len(result) > 1200:
-            result = result[:1200] + "\n... [truncated]"
+        result = _tool_result_preview(
+            name,
+            str(event.get("result") or ""),
+            is_error=is_error,
+        )
         title_style = "bold #ff4d5a" if is_error else "bold #22c55e"
         border_style = "#ff4d5a" if is_error else "#22c55e"
         status = "error" if is_error else "ok"
@@ -319,6 +363,21 @@ class RichRenderer:
                 result or "(empty result)",
                 title=Text(f"Tool Result · {name} · {status}", style=title_style),
                 border_style=border_style,
+            )
+        )
+
+    def _print_preserved_answer(self, event: dict[str, Any]) -> None:
+        text = str(event.get("text") or "").strip()
+        if not text:
+            return
+        self.console.print(
+            _output_panel(
+                Markdown(text),
+                title=Text(
+                    "Best Available Answer · verification incomplete",
+                    style="bold #facc15",
+                ),
+                border_style="#facc15",
             )
         )
 
@@ -352,6 +411,9 @@ class RichRenderer:
     def _print_stop_hook_review(self, event: dict[str, Any]) -> None:
         approved = bool(event.get("approved"))
         feedback = str(event.get("feedback") or "Answer verified.")
+        if approved:
+            self.console.print("[dim green]✓ Stop Hook verified[/dim green]")
+            return
         status = "approved" if approved else "revision required"
         color = "#22c55e" if approved else "#fb923c"
         self.console.print(
@@ -456,6 +518,40 @@ def _format_payload(payload: Any) -> str:
         return json.dumps(payload, ensure_ascii=False, indent=2)
     except TypeError:
         return str(payload)
+
+
+_QUIET_TOOL_RESULTS = {
+    "read_file",
+    "search_code",
+    "repo_map",
+    "document_symbols",
+    "grep",
+    "glob",
+    "glob_files",
+}
+
+
+def _tool_result_preview(name: str, result: str, *, is_error: bool) -> str:
+    if is_error or name not in _QUIET_TOOL_RESULTS:
+        if len(result) > 1200:
+            return result[:1200] + "\n... [truncated]"
+        return result or "(empty result)"
+
+    if name == "read_file":
+        path_match = re.search(r"(?m)^path:\s*(.+?)\s*$", result)
+        size_match = re.search(r"(?m)^size:\s*(\d+)\s*$", result)
+        path = path_match.group(1) if path_match else "requested file"
+        details = [f"Read {path}"]
+        if size_match:
+            details.append(f"{int(size_match.group(1)):,} bytes")
+        details.append("latest source loaded into Agent context")
+        return " · ".join(details) + "."
+
+    line_count = len(result.splitlines())
+    return (
+        f"{line_count} lines / {len(result):,} characters returned to Agent context. "
+        "Full result hidden from terminal."
+    )
 
 
 def _output_panel(renderable: Any, *, title: Text, border_style: str) -> Panel:

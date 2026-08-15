@@ -6,8 +6,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from prompt_toolkit import PromptSession
+from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from rich.console import Console
@@ -54,6 +55,24 @@ SLASH_COMMANDS = [
 ]
 
 
+_REPL_STYLE = Style.from_dict(
+    {
+        "prompt": "bold #ffffff bg:#262626",
+        "placeholder": "#9a9a9a bg:#262626",
+        "prompt.dim": "#a3a3a3 bg:#000000",
+        "prompt.count.agents": "bold #22d3ee bg:#000000",
+        "prompt.count.mcp": "bold #c084fc bg:#000000",
+        "prompt.count.skills": "bold #facc15 bg:#000000",
+        "prompt.tools": "bold #22d3ee bg:#000000",
+        "toolbar.model": "noreverse bold #ffffff bg:#000000",
+        "toolbar.ctx.bar": "noreverse #22c55e bg:#000000",
+        "toolbar.ctx.value": "noreverse #ffffff bg:#000000",
+        "toolbar.cwd.value": "noreverse #c084fc bg:#000000",
+        "toolbar.gap": "noreverse #ffffff bg:#000000",
+    }
+)
+
+
 async def start_repl(cwd: str, config: PaiCliConfig) -> None:
     console = Console()
     registry, mcp_manager = await build_tool_registry(config=config, cwd=cwd)
@@ -94,40 +113,36 @@ async def start_repl(cwd: str, config: PaiCliConfig) -> None:
 
     history_path = Path.home() / ".paicli" / "history" / "prompt_history.txt"
     history_path.parent.mkdir(parents=True, exist_ok=True)
-    session = PromptSession(
-        message=lambda: _prompt_message(
-            cwd=cwd,
-            model=client.model_name,
-            tools=tool_count,
-            agents_files=agents_file_count,
-            mcp_servers=mcp_server_count,
-            skills=skill_count,
-            stats=renderer.toolbar_status(),
-        ),
-        history=FileHistory(str(history_path)),
-        completer=WordCompleter(SLASH_COMMANDS, ignore_case=True),
-        placeholder=[("class:placeholder", "Type your message or @path/to/file")],
-        style=Style.from_dict(
-            {
-                "prompt": "bold #ffffff bg:#262626",
-                "placeholder": "#9a9a9a bg:#262626",
-                "prompt.dim": "#a3a3a3 bg:#000000",
-                "prompt.count.agents": "bold #22d3ee bg:#000000",
-                "prompt.count.mcp": "bold #c084fc bg:#000000",
-                "prompt.count.skills": "bold #facc15 bg:#000000",
-                "prompt.tools": "bold #22d3ee bg:#000000",
-                "toolbar.model": "noreverse bold #ffffff bg:#000000",
-                "toolbar.ctx.bar": "noreverse #22c55e bg:#000000",
-                "toolbar.ctx.value": "noreverse #ffffff bg:#000000",
-                "toolbar.cwd.value": "noreverse #c084fc bg:#000000",
-                "toolbar.gap": "noreverse #ffffff bg:#000000",
-            }
-        ),
-    )
+    history = FileHistory(str(history_path))
+    session = None
+    if os.name != "nt":
+        session = PromptSession(
+            message=_prompt_message(),
+            history=history,
+            completer=WordCompleter(SLASH_COMMANDS, ignore_case=True),
+            placeholder=[("class:placeholder", "Type your message or @path/to/file")],
+            style=_REPL_STYLE,
+            reserve_space_for_menu=0,
+        )
 
     while True:
         try:
-            user_input = await session.prompt_async()
+            _print_prompt_status(
+                cwd=cwd,
+                model=client.model_name,
+                tools=tool_count,
+                agents_files=agents_file_count,
+                mcp_servers=mcp_server_count,
+                skills=skill_count,
+                stats=renderer.toolbar_status(),
+            )
+            if os.name == "nt":
+                user_input = _native_console_input()
+                if user_input:
+                    history.append_string(user_input)
+            else:
+                assert session is not None
+                user_input = await session.prompt_async()
         except (EOFError, KeyboardInterrupt):
             console.print()
             return
@@ -232,7 +247,9 @@ async def _handle_slash(
         output = "\n".join(f"{r.path}:{r.start_line}: {r.snippet} [{r.reason}]" for r in results)
         if truncated:
             output += "\n(results truncated; refine the query)"
-        console.print(output or "(no matches)")
+        # Search reasons use square brackets (for example, "[exact symbol match]").
+        # Disable Rich markup so those evidence labels remain visible to the user.
+        console.print(output or "(no matches)", markup=False)
     elif command == "/plan":
         if not arg:
             console.print("[red]Usage:[/red] /plan <task>")
@@ -460,7 +477,42 @@ def _count_named_files(root: str, filename: str) -> int:
     return count
 
 
-def _prompt_message(
+def _prompt_message() -> list[tuple[str, str]]:
+    return [("class:prompt", "* ")]
+
+
+def _native_console_input() -> str:
+    """Use ReadConsoleW-backed input on Windows for reliable CJK IME editing."""
+    return input("* ")
+
+
+def _print_prompt_status(
+    *,
+    cwd: str,
+    model: str,
+    tools: int,
+    agents_files: int,
+    mcp_servers: int,
+    skills: int,
+    stats: dict[str, Any] | None = None,
+) -> None:
+    print_formatted_text(
+        FormattedText(
+            _prompt_status(
+                cwd=cwd,
+                model=model,
+                tools=tools,
+                agents_files=agents_files,
+                mcp_servers=mcp_servers,
+                skills=skills,
+                stats=stats,
+            )
+        ),
+        style=_REPL_STYLE,
+    )
+
+
+def _prompt_status(
     *,
     cwd: str,
     model: str,
@@ -480,8 +532,6 @@ def _prompt_message(
         ("class:prompt.tools", str(tools)),
         ("class:prompt.dim", "\n"),
         *_bottom_toolbar(cwd, model, stats),
-        ("class:prompt.dim", "\n\n"),
-        ("class:prompt", "* "),
     ]
 
 

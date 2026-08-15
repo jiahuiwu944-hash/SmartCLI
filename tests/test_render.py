@@ -4,7 +4,12 @@ from io import StringIO
 
 from rich.console import Console
 
-from paicli.entrypoints.repl import _bottom_toolbar, _prompt_message
+from paicli.entrypoints.repl import (
+    _bottom_toolbar,
+    _native_console_input,
+    _prompt_message,
+    _prompt_status,
+)
 from paicli.render import RichRenderer
 
 
@@ -34,8 +39,8 @@ def test_banner_renders_pi_home_layout():
     assert "What's new (v0.1.0)" in output
 
 
-def test_prompt_message_keeps_status_and_input_together():
-    prompt = _prompt_message(
+def test_prompt_status_is_separate_from_editable_input():
+    status = _prompt_status(
         cwd="/tmp/project",
         model="deepseek-v4-flash",
         tools=12,
@@ -44,18 +49,32 @@ def test_prompt_message_keeps_status_and_input_together():
         skills=3,
         stats={"total_tokens": 13187, "context_ratio": 0.013, "has_usage": True},
     )
-    plain = "".join(text for _style, text in prompt)
+    status_plain = "".join(text for _style, text in status)
+    prompt_plain = "".join(text for _style, text in _prompt_message())
 
-    assert "2 AGENTS.md files" in plain
-    assert "1 MCP server" in plain
-    assert "3 skills · Tools 12" in plain
-    assert "YOLO" not in plain
-    assert "Shift+Tab" not in plain
-    assert "deepseek-v4-flash" in plain
-    assert "█░░░░░░░░░░░ 1%" in plain
-    assert "/tmp/project" in plain
-    assert "\n\n* " in plain
-    assert plain.endswith("\n* ")
+    assert "2 AGENTS.md files" in status_plain
+    assert "1 MCP server" in status_plain
+    assert "3 skills · Tools 12" in status_plain
+    assert "YOLO" not in status_plain
+    assert "Shift+Tab" not in status_plain
+    assert "deepseek-v4-flash" in status_plain
+    assert "█░░░░░░░░░░░ 1%" in status_plain
+    assert "/tmp/project" in status_plain
+    assert "* " not in status_plain
+    assert prompt_plain == "* "
+
+
+def test_native_console_input_uses_the_windows_line_editor(monkeypatch):
+    prompts = []
+
+    def fake_input(prompt):
+        prompts.append(prompt)
+        return "中文输入已修正"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    assert _native_console_input() == "中文输入已修正"
+    assert prompts == ["* "]
 
 
 def test_bottom_toolbar_uses_runtime_summary_segments():
@@ -86,8 +105,8 @@ def test_text_deltas_render_as_markdown_on_turn_complete():
     renderer.handle({"type": "done", "total_turns": 1, "total_tokens": 300})
 
     output = stream.getvalue()
-    assert "Thinking" in output
-    assert "需要先确认项目结构" in output
+    assert "Thinking" not in output
+    assert "需要先确认项目结构" not in output
     assert "Final Output" in output
     assert "SmartCLI" in output
     assert "read_file" in output
@@ -153,7 +172,7 @@ def test_interleaved_thinking_does_not_repeat_assistant_output_panels():
     output = stream.getvalue()
     assert output.count("Assistant Output") == 0
     assert output.count("Final Output") == 1
-    assert output.count("Thinking") == 1
+    assert output.count("Thinking") == 0
     assert "第一段第二段" in output
 
 
@@ -168,6 +187,20 @@ def test_streaming_text_waits_for_turn_boundary_by_default():
     assert "Assistant Output" not in stream.getvalue()
     renderer.handle({"type": "turn_complete"})
     assert stream.getvalue().count("Final Output") == 1
+
+
+def test_tool_use_turn_hides_transitory_model_narration():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console)
+
+    renderer.handle({"type": "text_delta", "text": "I will inspect the source first."})
+    renderer.handle({"type": "turn_complete", "stop_reason": "tool_use"})
+    renderer.handle({"type": "tool_call", "name": "read_file", "input": {"path": "x.py"}})
+
+    output = stream.getvalue()
+    assert "I will inspect the source first." not in output
+    assert "Tool Use" in output
 
 
 def test_tool_use_and_result_render_as_structured_panels():
@@ -191,6 +224,123 @@ def test_tool_use_and_result_render_as_structured_panels():
     assert '"path": "."' in output
     assert "Tool Result · list_dir · ok" in output
     assert "README.md" in output
+
+
+def test_thinking_can_be_enabled_explicitly():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console, show_thinking=True)
+
+    renderer.handle({"type": "thinking_delta", "thinking": "inspect the implementation"})
+    renderer.handle({"type": "turn_complete"})
+
+    output = stream.getvalue()
+    assert "Thinking" in output
+    assert "inspect the implementation" in output
+
+
+def test_large_read_file_result_is_hidden_but_metadata_remains_visible():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console)
+    result = (
+        "[FILE_METADATA]\n"
+        "path: src/paicli/agent/query.py\n"
+        "version: sha256:abc\n"
+        "size: 12345\n"
+        "[FILE_CONTENT]\n"
+        "SECRET_SOURCE_LINE = 'terminal should not print this'\n"
+    )
+
+    renderer.handle(
+        {
+            "type": "tool_result",
+            "name": "read_file",
+            "result": result,
+            "is_error": False,
+        }
+    )
+
+    output = stream.getvalue()
+    assert "src/paicli/agent/query.py" in output
+    assert "12,345 bytes" in output
+    assert "latest source loaded into Agent context" in output
+    assert "SECRET_SOURCE_LINE" not in output
+
+
+def test_preserved_answer_is_rendered_after_verification_exhaustion():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console)
+
+    renderer.handle(
+        {
+            "type": "answer_preserved",
+            "text": "This is the latest candidate answer.",
+            "verified": False,
+        }
+    )
+
+    output = stream.getvalue()
+    assert "Best Available Answer" in output
+    assert "verification incomplete" in output
+    assert "This is the latest candidate answer." in output
+
+
+def test_verified_answer_is_hidden_until_review_then_rendered_last():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console)
+
+    renderer.handle({"type": "text_delta", "text": "Verified final answer."})
+    renderer.handle(
+        {
+            "type": "turn_complete",
+            "stop_reason": "end_turn",
+            "verification_pending": True,
+        }
+    )
+    assert "Verified final answer." not in stream.getvalue()
+
+    renderer.handle(
+        {
+            "type": "stop_hook_review",
+            "approved": True,
+            "feedback": "Answer verified.",
+        }
+    )
+
+    output = stream.getvalue()
+    assert "Stop Hook verified" in output
+    assert "Final Output" in output
+    assert "Verified final answer." in output
+    assert output.index("Stop Hook verified") < output.index("Final Output")
+
+
+def test_rejected_candidate_answer_is_not_rendered():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console)
+
+    renderer.handle({"type": "text_delta", "text": "Unverified draft."})
+    renderer.handle(
+        {
+            "type": "turn_complete",
+            "stop_reason": "end_turn",
+            "verification_pending": True,
+        }
+    )
+    renderer.handle(
+        {
+            "type": "stop_hook_review",
+            "approved": False,
+            "feedback": "Run the tests first.",
+        }
+    )
+
+    output = stream.getvalue()
+    assert "Unverified draft." not in output
+    assert "Run the tests first." in output
 
 
 def test_start_run_resets_token_usage():

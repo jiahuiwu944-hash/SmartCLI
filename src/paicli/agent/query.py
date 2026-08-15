@@ -270,7 +270,17 @@ async def query(
         elif thinking:
             assistant_message.content = ""
         messages.append(assistant_message)
-        yield {"type": "turn_complete", "turn": turn, "stop_reason": stop_reason}
+        yield {
+            "type": "turn_complete",
+            "turn": turn,
+            "stop_reason": stop_reason,
+            "verification_pending": bool(
+                use_stop_hook
+                and stop_reason != "tool_use"
+                and stop_reason != "max_tokens"
+                and not tool_calls
+            ),
+        }
 
         if stop_reason != "tool_use" and not tool_calls:
             if stop_reason == "max_tokens":
@@ -300,6 +310,13 @@ async def query(
                 termination_reason = "stop_hook_connection_error"
                 termination_message = friendly_llm_error(exc, source="stop_hook")
                 yield llm_error_event(exc, messages=messages, source="stop_hook")
+                if text.strip():
+                    yield {
+                        "type": "answer_preserved",
+                        "text": text,
+                        "reason": termination_reason,
+                        "verified": False,
+                    }
                 break
             total_tokens += hook_result.input_tokens + hook_result.output_tokens
             if hook_result.input_tokens or hook_result.output_tokens:
@@ -324,8 +341,9 @@ async def query(
             if stop_hook_retry_limit and stop_hook_retries > stop_hook_retry_limit:
                 termination_reason = "stop_hook_retries_exhausted"
                 termination_message = (
-                    "Stop Hook still found the result incomplete after "
-                    f"{stop_hook_retry_limit} correction attempts: {hook_result.feedback}"
+                    "Stop Hook rejected the answer after "
+                    f"{stop_hook_retry_limit} correction attempts. "
+                    "No unverified draft was shown as a final answer."
                 )
                 yield _run_stopped_event(
                     termination_reason,
