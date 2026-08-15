@@ -52,6 +52,8 @@ class PromptAssembler:
             "reference direction instead of repeating it.",
             "- Before changing code, inspect the target symbol, its callers, and relevant "
             "tests; after changing it, run diagnose_file or tests.",
+            "- Batch multiple tool calls only when they are independent. If a later call "
+            "depends on an earlier result, wait for the next ReAct turn.",
             "- When writing files, use write_file and keep changes scoped.",
             "- Before overwriting or appending to an existing file, call read_file and pass "
             "its returned version to write_file as expected_version.",

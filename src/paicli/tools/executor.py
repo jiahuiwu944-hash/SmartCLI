@@ -22,32 +22,37 @@ class ToolExecutor:
         calls: list[dict[str, Any]],
         context: ToolContext,
     ) -> list[ToolResult]:
-        read_calls: list[tuple[dict[str, Any], Tool]] = []
-        sequential_calls: list[tuple[dict[str, Any], Tool | None]] = []
-
-        for call in calls:
-            name = _tool_call_name(call)
-            tool = self.registry.get(name)
-            if tool and tool.is_read_only and tool.is_concurrency_safe:
-                read_calls.append((call, tool))
-            else:
-                sequential_calls.append((call, tool))
-
         results: list[ToolResult] = []
-        if read_calls:
-            semaphore = asyncio.Semaphore(context.config.tools.max_concurrent_read)
+        read_batch: list[tuple[dict[str, Any], Tool]] = []
+        semaphore = asyncio.Semaphore(context.config.tools.max_concurrent_read)
+
+        async def flush_read_batch() -> None:
+            if not read_batch:
+                return
 
             async def run_read(call: dict[str, Any], tool: Tool) -> ToolResult:
                 async with semaphore:
                     return await self._execute_single(call, tool, context)
 
             results.extend(
-                await asyncio.gather(*(run_read(call, tool) for call, tool in read_calls))
+                await asyncio.gather(*(run_read(call, tool) for call, tool in read_batch))
             )
+            read_batch.clear()
 
-        for call, tool in sequential_calls:
+        for call in calls:
+            name = _tool_call_name(call)
+            tool = self.registry.get(name)
+            if tool and tool.is_read_only and tool.is_concurrency_safe:
+                read_batch.append((call, tool))
+                continue
+
+            # A side-effecting or concurrency-unsafe tool is an execution barrier.
+            # Complete the preceding read batch before running it, preserving the
+            # model's original Tool Call order.
+            await flush_read_batch()
             results.append(await self._execute_single(call, tool, context))
 
+        await flush_read_batch()
         return results
 
     async def _execute_single(
