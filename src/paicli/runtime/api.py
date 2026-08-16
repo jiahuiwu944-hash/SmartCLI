@@ -114,7 +114,7 @@ class RuntimeApiServer:
     async def _run_turn(self, thread_id: str, message: str) -> dict[str, Any]:
         self._ensure_llm_key()
         self._append_event(thread_id, "turn.started", {"message": message})
-        registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
+        registry, manager = await build_tool_registry(config=self.config, cwd=self.cwd)
         engine = QueryEngine(
             llm_client=create_llm_client(self.config.llm),
             tool_registry=registry,
@@ -122,13 +122,21 @@ class RuntimeApiServer:
             cwd=self.cwd,
         )
         text = ""
-        async for event in engine.ask(message):
-            event_type = str(event.get("type"))
-            if event_type == "text_delta":
-                text += str(event.get("text") or "")
-                self._append_event(thread_id, "message.delta", {"text": event.get("text") or ""})
-            elif event_type in {"tool_call", "tool_result", "error", "done"}:
-                self._append_event(thread_id, event_type, _jsonable(event))
+        try:
+            async for event in engine.ask(message):
+                event_type = str(event.get("type"))
+                if event_type == "text_delta":
+                    text += str(event.get("text") or "")
+                    self._append_event(
+                        thread_id,
+                        "message.delta",
+                        {"text": event.get("text") or ""},
+                    )
+                elif event_type in {"tool_call", "tool_result", "error", "done"}:
+                    self._append_event(thread_id, event_type, _jsonable(event))
+        finally:
+            if manager:
+                await manager.close()
         self._append_event(thread_id, "turn.completed", {"text": text})
         return {"thread_id": thread_id, "text": text}
 
@@ -146,14 +154,18 @@ class RuntimeApiServer:
 
     async def _run_task(self, prompt: str) -> str:
         self._ensure_llm_key()
-        registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
+        registry, manager = await build_tool_registry(config=self.config, cwd=self.cwd)
         engine = QueryEngine(
             llm_client=create_llm_client(self.config.llm),
             tool_registry=registry,
             config=self.config,
             cwd=self.cwd,
         )
-        return (await engine.ask_complete_async(prompt)).text
+        try:
+            return (await engine.ask_complete_async(prompt)).text
+        finally:
+            if manager:
+                await manager.close()
 
     def _ensure_llm_key(self) -> None:
         if not self.config.llm.api_key:

@@ -7,8 +7,14 @@ from typing import Any
 import httpx
 
 from paicli.agent import Agent, QueryEngine
-from paicli.agent.stop_hook import verify_answer
+from paicli.agent.stop_hook import (
+    _parse_memory_candidates,
+    _parse_verdict,
+    _recent_tool_evidence,
+    verify_answer,
+)
 from paicli.config import load_config
+from paicli.memory import MemoryManager
 from paicli.tools import ToolRegistry, get_builtin_tools
 from paicli.types import Message
 
@@ -66,6 +72,319 @@ def test_query_engine_executes_tool_and_replays_result(tmp_path, monkeypatch):
     assert result.turns == 2
     assert result.completed is True
     assert result.termination_reason == "completed"
+
+
+class SkillActivationClient:
+    model_name = "fake-model"
+    provider_name = "fake-provider"
+    max_context_window = 4_000
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        if "Stop Hook reviewer" in system_prompt:
+            yield {"type": "text_delta", "text": '{"approved":true,"feedback":""}'}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+            return
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "type": "tool_call_delta",
+                "tool_call": {
+                    "index": 0,
+                    "id": "skill_1",
+                    "function": {"name": "load_skill", "arguments": '{"name":"demo"}'},
+                },
+            }
+            yield {"type": "message_end", "stop_reason": "tool_use"}
+            return
+        assert any(
+            message.role == "user"
+            and "Skill instructions activated for the current task" in message.content
+            and "follow the demo workflow" in message.content
+            for message in messages
+        )
+        yield {"type": "text_delta", "text": "skill applied"}
+        yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+def test_loaded_skill_is_injected_into_current_react_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    skill_dir = tmp_path / ".paicli" / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "---\nname: demo\ndescription: demo workflow\n---\nfollow the demo workflow\n",
+        encoding="utf-8",
+    )
+    config = load_config(project_root=tmp_path)
+    registry = ToolRegistry()
+    registry.register_all(get_builtin_tools())
+    engine = QueryEngine(
+        llm_client=SkillActivationClient(),
+        tool_registry=registry,
+        config=config,
+        cwd=str(tmp_path),
+    )
+
+    result = asyncio.run(engine.ask_complete_async("use the demo skill"))
+
+    assert result.text == "skill applied"
+
+
+class SkillBarrierClient:
+    model_name = "fake-model"
+    provider_name = "fake-provider"
+    max_context_window = 4_000
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "type": "tool_call_delta",
+                "tool_call": {
+                    "index": 0,
+                    "id": "load_demo",
+                    "function": {"name": "load_skill", "arguments": '{"name":"demo"}'},
+                },
+            }
+            yield {
+                "type": "tool_call_delta",
+                "tool_call": {
+                    "index": 1,
+                    "id": "premature_write",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path":"should_not_exist.txt","content":"bad"}',
+                    },
+                },
+            }
+            yield {"type": "message_end", "stop_reason": "tool_use"}
+            return
+        assert any(
+            message.role == "tool"
+            and message.tool_call_id == "premature_write"
+            and "skill activation barrier" in message.content
+            for message in messages
+        )
+        assert any(
+            message.role == "user" and "follow the demo workflow" in message.content
+            for message in messages
+        )
+        yield {"type": "text_delta", "text": "barrier worked"}
+        yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+def test_load_skill_defers_other_tools_until_next_react_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    skill_dir = tmp_path / ".paicli" / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "---\nname: demo\ndescription: demo workflow\n---\nfollow the demo workflow\n",
+        encoding="utf-8",
+    )
+    config = load_config(project_root=tmp_path)
+    config.agent.stop_hook_enabled = False
+    registry = ToolRegistry()
+    registry.register_all(get_builtin_tools())
+    engine = QueryEngine(
+        llm_client=SkillBarrierClient(),
+        tool_registry=registry,
+        config=config,
+        cwd=str(tmp_path),
+    )
+
+    result = asyncio.run(engine.ask_complete_async("load before acting"))
+
+    assert result.text == "barrier worked"
+    assert not (tmp_path / "should_not_exist.txt").exists()
+
+
+def test_stop_hook_evidence_keeps_first_actions_and_latest_verification():
+    messages = [
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "load_1",
+                    "function": {"name": "load_skill", "arguments": '{"name":"web"}'},
+                },
+                {
+                    "id": "fetch_1",
+                    "function": {"name": "web_fetch", "arguments": '{"url":"https://x"}'},
+                },
+            ],
+        ),
+        Message(role="tool", content="skill loaded", tool_call_id="load_1"),
+        Message(role="tool", content="empty page", tool_call_id="fetch_1"),
+    ]
+    for index in range(20):
+        call_id = f"probe_{index}"
+        messages.extend(
+            [
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": call_id,
+                            "function": {
+                                "name": "bash",
+                                "arguments": f'{{"command":"probe {index}"}}',
+                            },
+                        }
+                    ],
+                ),
+                Message(role="tool", content="x" * 900, tool_call_id=call_id),
+            ]
+        )
+
+    evidence = _recent_tool_evidence(messages, max_chars=3_000)
+
+    assert "id=load_1 name=load_skill" in evidence
+    assert "id=fetch_1 name=web_fetch" in evidence
+    assert "id=probe_19 name=bash" in evidence
+    assert "middle tool evidence entries omitted" in evidence
+
+
+class AutoMemoryClient(FakeClient):
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        if "Stop Hook reviewer" in system_prompt:
+            yield {
+                "type": "text_delta",
+                "text": (
+                    '{"approved":true,"feedback":"","memories":['
+                    '{"key":"project.note_format","category":"fact",'
+                    '"content":"The verified note contains hello.",'
+                    '"importance":0.7,"confidence":0.95,'
+                    '"evidence":"read_file returned the note",'
+                    '"evidence_ids":["call_1"]}]}'
+                ),
+            }
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+            return
+        async for event in super().chat(messages, tools, system_prompt=system_prompt):
+            yield event
+
+
+def test_stop_hook_approved_memory_is_persisted_after_react(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "note.txt").write_text("hello\n", encoding="utf-8")
+    config = load_config(project_root=tmp_path)
+    config.memory.long_term_db_path = str(tmp_path / "memory.db")
+    registry = ToolRegistry()
+    registry.register_all(get_builtin_tools())
+    engine = QueryEngine(
+        llm_client=AutoMemoryClient(),
+        tool_registry=registry,
+        config=config,
+        cwd=str(tmp_path),
+    )
+
+    events = asyncio.run(_collect_events(engine))
+
+    capture = next(event for event in events if event["type"] == "memory_capture")
+    assert capture["actions"] == ["inserted"]
+    rows = MemoryManager(config.memory.long_term_db_path, scope=tmp_path).list()
+    assert rows[0].memory_key == "project.note_format"
+    assert rows[0].source == "stop_hook"
+
+
+class ScratchCleanupClient:
+    model_name = "fake-model"
+    provider_name = "fake-provider"
+    max_context_window = 1000
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "type": "tool_call_delta",
+                "tool_call": {
+                    "index": 0,
+                    "id": "scratch_1",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": (
+                            '{"path":".paicli/tmp/tmp_agent_probe.py",'
+                            '"content":"print(1)\\n"}'
+                        ),
+                    },
+                },
+            }
+            yield {"type": "message_end", "stop_reason": "tool_use"}
+            return
+        yield {"type": "text_delta", "text": "done"}
+        yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+def test_stop_hook_parser_ignores_unrelated_braces_before_json_verdict():
+    approved, feedback = _parse_verdict(
+        'Checked evidence {tool: pytest}.\n{"approved": true, "feedback": "verified"}'
+    )
+
+    assert approved is True
+    assert feedback == "verified"
+
+
+def test_stop_hook_parser_uses_last_valid_json_verdict():
+    approved, feedback = _parse_verdict(
+        '{"note": "intermediate"}\n'
+        '{"approved": false, "feedback": "run the full suite"}'
+    )
+
+    assert approved is False
+    assert feedback == "run the full suite"
+
+
+def test_stop_hook_parser_recovers_boolean_from_json_like_response():
+    approved, feedback = _parse_verdict(
+        '{"approved": true, "feedback": "tests passed\nbut JSON string was malformed"}'
+    )
+
+    assert approved is True
+    assert "tests passed" in feedback
+
+
+def test_stop_hook_parser_extracts_memory_candidates_only_when_approved():
+    approved = (
+        '{"approved":true,"feedback":"","memories":['
+        '{"key":"project.test_framework","content":"Uses pytest"}]}'
+    )
+    rejected = (
+        '{"approved":false,"feedback":"missing test","memories":['
+        '{"key":"project.test_framework","content":"Uses pytest"}]}'
+    )
+
+    assert _parse_memory_candidates(approved)[0]["key"] == "project.test_framework"
+    assert _parse_memory_candidates(rejected) == []
+
+
+def test_query_cleans_managed_scratch_files_when_run_finishes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = load_config(project_root=tmp_path)
+    config.agent.stop_hook_enabled = False
+    config.policy.hitl_mode = "never"
+    registry = ToolRegistry()
+    registry.register_all(get_builtin_tools())
+    engine = QueryEngine(
+        llm_client=ScratchCleanupClient(),
+        tool_registry=registry,
+        config=config,
+        cwd=str(tmp_path),
+    )
+
+    result = asyncio.run(engine.ask_complete_async("create and run a temporary probe"))
+
+    assert result.text == "done"
+    assert not (tmp_path / ".paicli" / "tmp" / "tmp_agent_probe.py").exists()
 
 
 class ToolFailureObservationClient:

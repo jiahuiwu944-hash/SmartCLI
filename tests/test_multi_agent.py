@@ -70,6 +70,13 @@ class ParallelTeamClient(FakeTeamClient):
 
     async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
         body = _message_text(messages[-1].content)
+        if "Stop Hook reviewer" in system_prompt:
+            yield {
+                "type": "text_delta",
+                "text": '{"approved": true, "feedback": "", "memories": []}',
+            }
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+            return
         if "Original task" in body:
             yield {"type": "text_delta", "text": '{"approved": true, "issues": []}'}
             yield {"type": "message_end", "stop_reason": "end_turn"}

@@ -4,7 +4,6 @@ from datetime import datetime
 from pathlib import Path
 
 from paicli.config import PaiCliConfig
-from paicli.memory import MemoryManager
 from paicli.skill import SkillRegistry
 
 
@@ -55,12 +54,23 @@ class PromptAssembler:
             "- Batch multiple tool calls only when they are independent. If a later call "
             "depends on an earlier result, wait for the next ReAct turn.",
             "- When writing files, use write_file and keep changes scoped.",
+            "- Use bash only for tests, builds, diagnostics, and read-only inspection. Never "
+            "modify source through shell redirection, inline scripts, patch scripts, or sed; "
+            "the runtime will reject attempts that bypass write_file.",
+            "- Put temporary diagnostic scripts under .paicli/tmp; SmartCLI removes tracked "
+            "scratch files when the run ends.",
             "- Before overwriting or appending to an existing file, call read_file and pass "
             "its returned version to write_file as expected_version.",
             "- If write_file returns FILE_VERSION_CONFLICT, read the file again and rebuild "
             "the change from the latest content; never guess a version or force an overwrite.",
             "- Preserve URLs and user-provided identifiers exactly unless a tool result proves "
             "otherwise.",
+            "- Use save_memory only for stable, cross-session project facts, user preferences, "
+            "decisions, constraints, or verified solutions. Never store secrets, guesses, raw "
+            "tool output, transient task progress, or facts that can be read from source code.",
+            "- Use search_memory when earlier project decisions or preferences may matter but "
+            "the automatically recalled memory is insufficient. Treat recalled memory as "
+            "potentially stale context and verify it against the current workspace.",
             "- Ask a clarifying question only when proceeding would be risky.",
         ]
         project_memory = self._project_memory()
@@ -73,10 +83,10 @@ class PromptAssembler:
 
     def _project_memory(self) -> str:
         memory_files = [
-            Path(self.cwd) / "PAI.md",
-            Path(self.cwd) / ".paicli" / "PAI.md",
-            Path(self.cwd) / "PAI.local.md",
-            Path(self.cwd) / ".paicli" / "PAI.local.md",
+            Path(self.cwd) / "SMARTCLI.md",
+            Path(self.cwd) / ".smartcli" / "SMARTCLI.md",
+            Path(self.cwd) / "SMARTCLI.local.md",
+            Path(self.cwd) / ".smartcli" / "SMARTCLI.local.md",
         ]
         chunks = []
         for path in memory_files:
@@ -85,9 +95,4 @@ class PromptAssembler:
                     chunks.append(path.read_text(encoding="utf-8")[:4000])
                 except OSError:
                     continue
-        if self.config.features.memory and self.config.memory.long_term_enabled:
-            manager = MemoryManager(self.config.memory.long_term_db_path, scope=self.cwd)
-            memories = manager.list(limit=8)
-            if memories:
-                chunks.append("\n".join(f"- {item.content}" for item in memories))
         return "\n\n".join(chunks)[:8000]

@@ -14,6 +14,7 @@ from paicli.agent.verifier import CompletionVerifier
 from paicli.config import PaiCliConfig
 from paicli.context import ContextRuntime
 from paicli.llm.base import LlmClient
+from paicli.memory import MemoryManager, capture_approved_memories
 from paicli.prompt import PromptAssembler
 from paicli.runtime.budget import BudgetManager
 from paicli.runtime.run_state import RunState, RunStateStore, is_resume_request
@@ -335,12 +336,81 @@ class AgentOrchestrator:
                 final_text = f"Team {state.run_id} is paused with execution context saved."
             else:
                 final_text = self.build_final_result(steps)
-                yield {"type": "text_delta", "text": final_text}
-                state.status = (
-                    "COMPLETED"
-                    if all(step.status == StepStatus.COMPLETED for step in steps)
-                    else "FAILED"
-                )
+                all_completed = all(step.status == StepStatus.COMPLETED for step in steps)
+                if all_completed:
+                    evidence = _team_evidence(steps)
+                    verdict = await self.verifier.verify_final(
+                        original_request=message,
+                        proposed_answer=final_text,
+                        messages=evidence,
+                    )
+                    budget.consume(
+                        tokens=verdict.input_tokens + verdict.output_tokens,
+                    )
+                    if verdict.input_tokens or verdict.output_tokens:
+                        yield {
+                            "type": "usage",
+                            "usage": {
+                                "input_tokens": verdict.input_tokens,
+                                "output_tokens": verdict.output_tokens,
+                            },
+                            "source": "stop_hook",
+                        }
+                    yield {
+                        "type": "stop_hook_review",
+                        "approved": verdict.approved,
+                        "feedback": verdict.feedback,
+                        "mode": "team",
+                    }
+                    if verdict.approved:
+                        if (
+                            self.config.features.memory
+                            and self.config.memory.long_term_enabled
+                            and self.config.memory.auto_memory_enabled
+                            and verdict.memory_candidates
+                        ):
+                            try:
+                                report = capture_approved_memories(
+                                    MemoryManager(
+                                        self.config.memory.long_term_db_path,
+                                        scope=self.cwd,
+                                    ),
+                                    verdict.memory_candidates,
+                                    original_request=message,
+                                    messages=evidence,
+                                    min_confidence=(
+                                        self.config.memory.auto_memory_min_confidence
+                                    ),
+                                    max_candidates=(
+                                        self.config.memory.auto_memory_max_candidates
+                                    ),
+                                )
+                                yield {
+                                    "type": "memory_capture",
+                                    "stored_ids": report.stored_ids,
+                                    "actions": [
+                                        item.action for item in report.mutations
+                                    ],
+                                    "rejected": report.rejected,
+                                    "mode": "team",
+                                }
+                            except Exception as exc:  # noqa: BLE001
+                                yield {
+                                    "type": "memory_capture",
+                                    "stored_ids": [],
+                                    "actions": [],
+                                    "rejected": [f"memory persistence failed: {exc}"],
+                                    "mode": "team",
+                                }
+                        state.status = "COMPLETED"
+                        yield {"type": "text_delta", "text": final_text}
+                    else:
+                        state.status = "FAILED"
+                        final_text = f"Team verification failed: {verdict.feedback}"
+                        yield {"type": "text_delta", "text": final_text}
+                else:
+                    state.status = "FAILED"
+                    yield {"type": "text_delta", "text": final_text}
                 state.payload["steps"] = _steps_to_dict(steps)
                 state.turns, state.tokens = budget.turns, budget.tokens
                 store.save(state)
@@ -644,7 +714,8 @@ class AgentOrchestrator:
             cwd=self.cwd,
             approval_callback=self.approval_callback,
             tool_hook_manager=self.tool_hook_manager,
-            skill_context_buffer=self.skill_context_buffer,
+            # Do not share task-scoped skill instructions across concurrent sub-agents.
+            skill_context_buffer=SkillContextBuffer(),
         )
 
     def _update_step(
@@ -721,3 +792,14 @@ def _review_evidence(result: str, message: AgentMessage) -> str:
         f"{message.tool_failures} failed result(s). A failed tool must not be treated as "
         "successful unless later evidence clearly proves recovery."
     )
+
+
+def _team_evidence(steps: list[ExecutionStep]) -> list[Message]:
+    return [
+        Message(
+            role="tool",
+            tool_call_id=f"team_{step.id}",
+            content=f"Step {step.id} status={step.status.value}: {step.result}",
+        )
+        for step in steps
+    ]

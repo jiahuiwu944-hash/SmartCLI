@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from io import StringIO
 
 from rich.console import Console
@@ -224,6 +225,31 @@ def test_tool_use_and_result_render_as_structured_panels():
     assert '"path": "."' in output
     assert "Tool Result · list_dir · ok" in output
     assert "README.md" in output
+
+
+def test_search_code_preview_reads_structured_match_count():
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=120)
+    renderer = RichRenderer(console=console)
+    result = json.dumps(
+        {
+            "query": "ToolExecutor",
+            "matches": [{"path": "executor.py"}, {"path": "query.py"}],
+            "truncated": True,
+        }
+    )
+
+    renderer.handle(
+        {
+            "type": "tool_result",
+            "name": "search_code",
+            "result": result,
+            "is_error": False,
+        }
+    )
+
+    output = stream.getvalue()
+    assert "Search ToolExecutor: 2 candidate match(es) (truncated)." in output
 
 
 def test_thinking_can_be_enabled_explicitly():

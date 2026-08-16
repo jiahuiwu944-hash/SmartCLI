@@ -21,7 +21,7 @@ from paicli.bootstrap import build_tool_registry
 from paicli.codeintel import CodeNavigator
 from paicli.config import PaiCliConfig, config_to_public_dict
 from paicli.llm import create_llm_client
-from paicli.memory import MemoryManager
+from paicli.memory import MemoryEntry, MemoryManager
 from paicli.policy import AuditLog
 from paicli.prompt import PromptAssembler
 from paicli.render import RichRenderer
@@ -145,6 +145,8 @@ async def start_repl(cwd: str, config: PaiCliConfig) -> None:
                 user_input = await session.prompt_async()
         except (EOFError, KeyboardInterrupt):
             console.print()
+            if mcp_manager:
+                await mcp_manager.close()
             return
         message = user_input.strip()
         if not message:
@@ -152,6 +154,8 @@ async def start_repl(cwd: str, config: PaiCliConfig) -> None:
         if message.startswith("/"):
             should_exit = await _handle_slash(message, console, cwd, config, agent, registry)
             if should_exit:
+                if mcp_manager:
+                    await mcp_manager.close()
                 return
             continue
         await _run_agent(agent, renderer, message)
@@ -170,6 +174,34 @@ async def _run_events(events, renderer: RichRenderer, context_window: int | None
         if event.get("type") == "error":
             break
     renderer.newline()
+
+
+_SEARCH_MODES = ("auto", "symbol", "text", "references")
+
+
+def _parse_search_args(arg: str) -> tuple[str, str]:
+    """Parse /search arguments into a (mode, query) pair.
+
+    Accepts an optional leading ``--mode <mode>`` flag followed by the query;
+    defaults to the auto mode when the flag is omitted, preserving the legacy
+    ``/search <query>`` behavior.
+
+    Raises ValueError when the query is missing or the mode is unsupported.
+    """
+    tokens = arg.split()
+    mode = "auto"
+    if tokens and tokens[0] == "--mode":
+        if len(tokens) < 2:
+            raise ValueError("missing value for --mode")
+        mode = tokens[1].lower()
+        tokens = tokens[2:]
+    if mode not in _SEARCH_MODES:
+        supported = ", ".join(_SEARCH_MODES)
+        raise ValueError(f"unsupported search mode: {mode}; expected one of {supported}")
+    query = " ".join(tokens).strip()
+    if not query:
+        raise ValueError("missing search query")
+    return mode, query
 
 
 async def _handle_slash(
@@ -220,8 +252,12 @@ async def _handle_slash(
         if not arg:
             console.print("[red]Usage:[/red] /save <fact>")
         else:
-            memory_id = MemoryManager(config.memory.long_term_db_path, scope=cwd).save(arg)
-            console.print(f"Saved memory #{memory_id}")
+            memory_id = MemoryManager(config.memory.long_term_db_path, scope=cwd).save(
+                arg,
+                source="user",
+                importance=0.7,
+            )
+            console.print(f"Saved or refreshed memory #{memory_id}")
     elif command == "/config":
         console.print_json(json.dumps(config_to_public_dict(config), ensure_ascii=False))
     elif command == "/tools":
@@ -243,13 +279,23 @@ async def _handle_slash(
             f"{stats['removed']} removed."
         )
     elif command == "/search":
-        results, truncated = CodeNavigator(cwd).search(arg, limit=20)
-        output = "\n".join(f"{r.path}:{r.start_line}: {r.snippet} [{r.reason}]" for r in results)
-        if truncated:
-            output += "\n(results truncated; refine the query)"
-        # Search reasons use square brackets (for example, "[exact symbol match]").
-        # Disable Rich markup so those evidence labels remain visible to the user.
-        console.print(output or "(no matches)", markup=False)
+        try:
+            mode, query = _parse_search_args(arg)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            console.print(
+                "[red]Usage:[/red] /search [--mode auto|symbol|text|references] <query>"
+            )
+        else:
+            results, truncated = CodeNavigator(cwd).search(query, mode=mode, limit=20)
+            output = "\n".join(
+                f"{r.path}:{r.start_line}: {r.snippet} [{r.reason}]" for r in results
+            )
+            if truncated:
+                output += "\n(results truncated; refine the query)"
+            # Search reasons use square brackets (for example, "[exact symbol match]").
+            # Disable Rich markup so those evidence labels remain visible to the user.
+            console.print(output or "(no matches)", markup=False)
     elif command == "/plan":
         if not arg:
             console.print("[red]Usage:[/red] /plan <task>")
@@ -313,12 +359,64 @@ async def _memory_command(arg: str, console: Console, cwd: str, config: PaiCliCo
     if sub == "clear":
         count = manager.clear()
         console.print(f"Cleared {count} memories.")
+    elif sub in {"delete", "forget"}:
+        if not rest.strip().isdigit():
+            console.print("Usage: /memory delete <id>")
+        elif manager.delete(int(rest.strip())):
+            console.print(f"Deleted memory #{rest.strip()}.")
+        else:
+            console.print(f"Memory #{rest.strip()} was not found in this project.")
     elif sub == "search":
         rows = manager.search(rest)
-        console.print("\n".join(f"#{row.id} {row.content}" for row in rows) or "(no matches)")
+        console.print(
+            "\n".join(_memory_line(row) for row in rows) or "(no matches)",
+            markup=False,
+        )
+    elif sub == "history":
+        rows = manager.list(limit=_positive_int(rest, 50), include_inactive=True)
+        console.print(
+            "\n".join(_memory_line(row) for row in rows) or "(no memories)",
+            markup=False,
+        )
+    elif sub == "restore":
+        if not rest.strip().isdigit():
+            console.print("Usage: /memory restore <id>")
+        elif manager.restore(int(rest.strip())):
+            console.print(f"Restored memory #{rest.strip()}.")
+        else:
+            console.print(f"Memory #{rest.strip()} was not found in this project.")
+    elif sub == "audit":
+        events = manager.audit(limit=_positive_int(rest, 20))
+        console.print(
+            "\n".join(
+                f"event#{event.id} memory#{event.memory_id} {event.action} "
+                f"{event.created_at} {event.details}"
+                for event in events
+            )
+            or "(no memory events)",
+            markup=False,
+        )
     else:
         rows = manager.list()
-        console.print("\n".join(f"#{row.id} {row.content}" for row in rows) or "(no memories)")
+        console.print(
+            "\n".join(_memory_line(row) for row in rows) or "(no memories)",
+            markup=False,
+        )
+
+
+def _memory_line(row: MemoryEntry) -> str:
+    key = f" key={row.memory_key}" if row.memory_key else ""
+    return (
+        f"#{row.id} [{row.status}; {row.category}; importance={row.importance:.1f}; "
+        f"confidence={row.confidence:.1f}{key}] {row.content}"
+    )
+
+
+def _positive_int(value: str, default: int) -> int:
+    try:
+        return max(1, int(value.strip()))
+    except (TypeError, ValueError):
+        return default
 
 
 def _hitl_command(arg: str, console: Console, config: PaiCliConfig) -> None:

@@ -200,6 +200,9 @@ async def _run_prompt(prompt: str, cwd: str, config) -> None:
     except Exception as exc:  # noqa: BLE001 - CLI should report model/config errors cleanly
         typer.echo(f"Fatal error: {exc}", err=True)
         raise typer.Exit(1) from exc
+    finally:
+        if manager:
+            await manager.close()
     typer.echo(result.text)
 
 

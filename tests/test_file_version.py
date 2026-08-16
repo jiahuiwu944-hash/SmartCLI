@@ -6,6 +6,7 @@ import json
 import pytest
 
 from paicli.agent import QueryEngine
+from paicli.codeintel import ContextLedger
 from paicli.config import load_config
 from paicli.policy import AuditLog
 from paicli.tools import ToolRegistry, get_builtin_tools
@@ -62,6 +63,58 @@ def test_matching_version_allows_atomic_overwrite(tmp_path, monkeypatch):
     assert data["version"] == content_version(b"new")
     assert data["atomic"] is True
     assert path.read_text(encoding="utf-8") == "new"
+
+
+def test_partial_read_cannot_replace_large_file_with_excerpt(tmp_path, monkeypatch):
+    path = tmp_path / "large.py"
+    original = "".join(f"line_{index} = {index}\n" for index in range(500))
+    path.write_text(original, encoding="utf-8")
+    context = _context(tmp_path, monkeypatch)
+    context.context_ledger = ContextLedger()
+    read_result = asyncio.run(
+        read_file({"path": "large.py", "offset": 200, "limit": 40}, context)
+    )
+    version = _version_from_tool_message(read_result.content)
+
+    result = asyncio.run(
+        write_file(
+            {
+                "path": "large.py",
+                "content": "line_200 = 200\nline_201 = 201\n",
+                "expected_version": version,
+            },
+            context,
+        )
+    )
+
+    assert result.is_error is True
+    assert _json(result)["status"] == "FILE_READ_INCOMPLETE"
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_complete_read_allows_intentional_large_replacement(tmp_path, monkeypatch):
+    path = tmp_path / "large.py"
+    original = "".join(f"line_{index} = {index}\n" for index in range(500))
+    path.write_text(original, encoding="utf-8")
+    context = _context(tmp_path, monkeypatch)
+    context.context_ledger = ContextLedger()
+    read_result = asyncio.run(read_file({"path": "large.py", "limit": 1_000}, context))
+    version = _version_from_tool_message(read_result.content)
+
+    result = asyncio.run(
+        write_file(
+            {
+                "path": "large.py",
+                "content": "replacement = True\n",
+                "expected_version": version,
+            },
+            context,
+        )
+    )
+
+    assert result.is_error is False
+    assert _json(result)["status"] == "WRITE_OK"
+    assert path.read_text(encoding="utf-8") == "replacement = True\n"
 
 
 def test_stale_version_rejects_overwrite_and_preserves_content(tmp_path, monkeypatch):

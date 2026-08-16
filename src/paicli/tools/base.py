@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from paicli.config import PaiCliConfig
@@ -27,8 +28,13 @@ class ToolContext:
         None
     )
     skill_context_buffer: Any | None = None
+    tool_registry: Any | None = None
     code_navigator: Any | None = None
     context_ledger: Any | None = None
+    scratch_files: set[Path] = field(default_factory=set)
+    exploration_call_count: int = 0
+    exploration_next_warning: int = 0
+    explored_read_ranges: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)

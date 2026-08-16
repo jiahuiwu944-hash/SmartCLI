@@ -5,8 +5,9 @@ from pathlib import Path
 
 from paicli.config import load_config
 from paicli.skill import SkillContextBuffer, SkillRegistry, SkillStateStore
+from paicli.tools import ToolRegistry, get_builtin_tools
 from paicli.tools.base import ToolContext
-from paicli.tools.builtins import load_skill
+from paicli.tools.builtins import load_skill, read_skill_resource
 
 
 def test_skill_registry_layers_and_state(tmp_path, monkeypatch):
@@ -65,6 +66,65 @@ def test_load_skill_pushes_body_into_context_buffer(tmp_path, monkeypatch):
     drained = buffer.drain()
     assert "Loaded Skill: demo" in drained
     assert "demo body" in drained
+
+
+def test_skill_resources_are_advertised_and_read_lazily(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    _write_skill(tmp_path / ".paicli" / "skills", "demo", "demo desc", "v1")
+    resource = tmp_path / ".paicli" / "skills" / "demo" / "references" / "guide.md"
+    resource.parent.mkdir(parents=True)
+    resource.write_text("detailed guide", encoding="utf-8")
+    config = load_config(project_root=tmp_path)
+    buffer = SkillContextBuffer()
+    registry = ToolRegistry()
+    registry.register_all(get_builtin_tools())
+    context = ToolContext(
+        cwd=str(tmp_path),
+        config=config,
+        skill_context_buffer=buffer,
+        tool_registry=registry,
+    )
+
+    loaded = asyncio.run(load_skill({"name": "demo"}, context))
+    instructions = buffer.drain_pending()
+    result = asyncio.run(
+        read_skill_resource({"name": "demo", "path": "references/guide.md"}, context)
+    )
+
+    assert not loaded.is_error
+    assert "references/guide.md" in instructions
+    assert result.content == "detailed guide"
+
+
+def test_skill_dependency_check_reports_missing_tool_and_mcp(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    skill_dir = tmp_path / ".paicli" / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "---\nname: demo\ndescription: demo\nrequires:\n"
+        "  tools: [read_file, unavailable_tool]\n"
+        "  mcp: [chrome-devtools]\n---\nbody\n",
+        encoding="utf-8",
+    )
+    config = load_config(project_root=tmp_path)
+    registry = ToolRegistry()
+    registry.register_all(get_builtin_tools())
+    context = ToolContext(cwd=str(tmp_path), config=config, tool_registry=registry)
+
+    result = asyncio.run(load_skill({"name": "demo"}, context))
+
+    assert result.is_error
+    assert "tool:unavailable_tool" in result.content
+    assert "mcp:chrome-devtools" in result.content
+
+
+def test_skill_buffer_start_task_discards_stale_instructions():
+    buffer = SkillContextBuffer()
+    buffer.push("old", "stale")
+
+    buffer.start_task()
+
+    assert buffer.is_empty()
 
 
 def _write_skill(

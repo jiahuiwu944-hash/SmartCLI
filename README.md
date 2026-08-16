@@ -93,6 +93,9 @@ PAICLI_LLM_RETRY_BASE_DELAY=0.5
 PAICLI_FILE_VERSION_CHECK=warn
 PAICLI_ATOMIC_FILE_WRITE=true
 PAICLI_CODE_INDEX=true
+PAICLI_AUTO_MEMORY=true
+PAICLI_AUTO_MEMORY_MIN_CONFIDENCE=0.8
+PAICLI_AUTO_MEMORY_MAX_CANDIDATES=3
 ```
 
 也可以使用兼容的 `PAICLI_API_KEY`：
@@ -178,6 +181,10 @@ uv run smartcli -p "解释这个仓库"
 /context
 /memory
 /memory search <query>
+/memory history [N]
+/memory audit [N]
+/memory restore <id>
+/memory delete <id>
 /memory clear
 /save <fact>
 /config
@@ -186,7 +193,7 @@ uv run smartcli -p "解释这个仓库"
 /policy
 /audit [N]
 /index [path]              # incrementally refresh SHA-256/symbol index
-/search <query>            # exact symbol + ripgrep navigation search
+/search [--mode auto|symbol|text|references] <query>  # default mode: auto
 /plan <task>
 /team <task>
 /model
@@ -220,10 +227,22 @@ SmartCLI 内置了一组 Agent 可以调用的本地工具和联网工具：
 - `web_fetch`
 - `save_memory`
 - `load_skill`
+- `read_skill_resource`
 - `search_code`
 - `repo_map`
 - `document_symbols`
 - `revert_turn`
+
+Skill 采用按需加载：启动时只向模型提供名称和描述，模型调用 `load_skill` 后，
+`SKILL.md` 正文会在当前任务的下一轮 ReAct 前生效，并在新任务开始时清理。
+Skill 可以在 `references/`、`templates/` 和 `examples/` 中附带资源，模型仅在需要时
+通过 `read_skill_resource` 读取。可在 frontmatter 中声明运行依赖：
+
+```yaml
+requires:
+  tools: [web_search, web_fetch]
+  mcp: [chrome-devtools]
+```
 
 写文件、执行命令、远程 MCP 写操作、恢复快照等危险动作，会经过 policy、HITL 和 audit 处理。
 
@@ -243,6 +262,10 @@ SmartCLI 可以连接 MCP server，并把远端工具动态注册为：
 mcp__<server-name>__<tool-name>
 ```
 
+客户端会并行初始化已启用的 server，并为每个 server 保持一个可复用的 MCP Session；
+工具调用发生超时或连接中断时，会按配置进行有限指数退避重连。Tool、Resource 和
+Prompt 只会在服务端声明对应 Capability 后注册，列表接口会自动遍历分页结果。
+
 初始化项目级 Chrome DevTools MCP 配置：
 
 ```bash
@@ -260,8 +283,12 @@ uv run smartcli mcp init-chrome --scope project
       "args": [
         "-y",
         "chrome-devtools-mcp@latest",
+        "--isolated",
         "--no-usage-statistics"
-      ]
+      ],
+      "timeout": 30,
+      "max_retries": 1,
+      "retry_base_delay": 0.25
     }
   }
 }

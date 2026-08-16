@@ -5,6 +5,7 @@ import json
 
 from paicli.agent import QueryEngine
 from paicli.config import load_config
+from paicli.tools import get_builtin_tools
 from paicli.tools.base import Tool, ToolContext, ToolResult, object_schema
 from paicli.tools.executor import ToolExecutor
 from paicli.tools.hooks import (
@@ -12,6 +13,7 @@ from paicli.tools.hooks import (
     ToolHookContext,
     ToolHookManager,
     ToolLifecycleHook,
+    cleanup_managed_scratch,
     default_tool_hooks,
 )
 from paicli.tools.registry import ToolRegistry
@@ -264,3 +266,205 @@ def test_input_rewrite_runs_before_default_approval_hook(tmp_path, monkeypatch):
     assert results[0].is_error is False
     assert approved_inputs == [{"value": "hello"}]
     assert executed_inputs == [{"value": "hello"}]
+
+
+def test_shell_guard_blocks_source_mutating_patch_script(tmp_path, monkeypatch):
+    executed = False
+    patch_script = tmp_path / "tmp_patch_source.py"
+    patch_script.write_text(
+        "path = 'src/demo.py'\n"
+        "text = open(path, encoding='utf-8').read()\n"
+        "open(path, 'w', encoding='utf-8').write(text.replace('a', 'b'))\n",
+        encoding="utf-8",
+    )
+
+    async def handler(payload, context):  # noqa: ARG001
+        nonlocal executed
+        executed = True
+        return ToolResult(content="unexpected")
+
+    tool = Tool(
+        name="bash",
+        description="shell",
+        parameters=object_schema({"command": {"type": "string"}}, ["command"]),
+        handler=handler,
+        required_keys=["command"],
+        is_read_only=False,
+    )
+    registry = ToolRegistry()
+    registry.register(tool)
+    context = _context(tmp_path, monkeypatch)
+    context.config.policy.hitl_mode = "never"
+
+    result = asyncio.run(
+        ToolExecutor(registry).execute_all(
+            [_call("bash", {"command": "python tmp_patch_source.py"})], context
+        )
+    )[0]
+
+    assert executed is False
+    assert result.is_error is True
+    assert "source-write guard" in result.content
+    assert "write_file" in result.content
+
+
+def test_shell_guard_allows_tests_and_diagnostics(tmp_path, monkeypatch):
+    executed = False
+    test_file = tmp_path / "tests" / "test_demo.py"
+    test_file.parent.mkdir()
+    test_file.write_text(
+        "from pathlib import Path\n"
+        "def test_write_fixture():\n"
+        "    Path('src/demo.py').write_text('fixture')\n",
+        encoding="utf-8",
+    )
+
+    async def handler(payload, context):  # noqa: ARG001
+        nonlocal executed
+        executed = True
+        return ToolResult(content="tests passed")
+
+    tool = Tool(
+        name="bash",
+        description="shell",
+        parameters=object_schema({"command": {"type": "string"}}, ["command"]),
+        handler=handler,
+        required_keys=["command"],
+        is_read_only=False,
+    )
+    registry = ToolRegistry()
+    registry.register(tool)
+    context = _context(tmp_path, monkeypatch)
+    context.config.policy.hitl_mode = "never"
+
+    result = asyncio.run(
+        ToolExecutor(registry).execute_all(
+            [_call("bash", {"command": "python -m pytest tests/test_demo.py -q"})], context
+        )
+    )[0]
+
+    assert executed is True
+    assert result.is_error is False
+
+
+def test_shell_guard_checks_only_direct_script_in_chained_pytest_command(
+    tmp_path, monkeypatch
+):
+    executed = False
+    probe = tmp_path / ".paicli" / "tmp" / "verify.py"
+    probe.parent.mkdir(parents=True)
+    probe.write_text("print('verified')\n", encoding="utf-8")
+    test_file = tmp_path / "tests" / "test_render.py"
+    test_file.parent.mkdir()
+    test_file.write_text(
+        "from pathlib import Path\n"
+        "def test_renderer(tmp_path):\n"
+        "    (tmp_path / 'render.py').write_text('fixture')\n",
+        encoding="utf-8",
+    )
+
+    async def handler(payload, context):  # noqa: ARG001
+        nonlocal executed
+        executed = True
+        return ToolResult(content="verified and tested")
+
+    tool = Tool(
+        name="bash",
+        description="shell",
+        parameters=object_schema({"command": {"type": "string"}}, ["command"]),
+        handler=handler,
+        required_keys=["command"],
+        is_read_only=False,
+    )
+    registry = ToolRegistry()
+    registry.register(tool)
+    context = _context(tmp_path, monkeypatch)
+    context.config.policy.hitl_mode = "never"
+
+    result = asyncio.run(
+        ToolExecutor(registry).execute_all(
+            [
+                _call(
+                    "bash",
+                    {
+                        "command": (
+                            "python .paicli/tmp/verify.py && "
+                            "python -m pytest tests/test_render.py -q"
+                        )
+                    },
+                )
+            ],
+            context,
+        )
+    )[0]
+
+    assert executed is True
+    assert result.is_error is False
+
+
+def test_scratch_files_are_isolated_tracked_and_cleaned(tmp_path, monkeypatch):
+    registry = ToolRegistry()
+    registry.register_all(get_builtin_tools())
+    context = _context(tmp_path, monkeypatch)
+    context.config.policy.hitl_mode = "never"
+
+    denied = asyncio.run(
+        ToolExecutor(registry).execute_all(
+            [_call("write_file", {"path": "tmp_probe.py", "content": "print('ok')\n"})],
+            context,
+        )
+    )[0]
+    allowed = asyncio.run(
+        ToolExecutor(registry).execute_all(
+            [
+                _call(
+                    "write_file",
+                    {"path": ".paicli/tmp/tmp_probe.py", "content": "print('ok')\n"},
+                    "call_2",
+                )
+            ],
+            context,
+        )
+    )[0]
+
+    managed = tmp_path / ".paicli" / "tmp" / "tmp_probe.py"
+    assert denied.is_error is True
+    assert ".paicli/tmp/tmp_probe.py" in denied.content
+    assert allowed.is_error is False
+    assert managed.exists()
+    assert managed.resolve() in context.scratch_files
+    assert cleanup_managed_scratch(context) == [str(managed.relative_to(tmp_path))]
+    assert not managed.exists()
+
+
+def test_exploration_guard_injects_convergence_feedback(tmp_path, monkeypatch):
+    async def handler(payload, context):  # noqa: ARG001
+        return ToolResult(content="diagnostic result")
+
+    tool = Tool(
+        name="bash",
+        description="shell",
+        parameters=object_schema({"command": {"type": "string"}}, ["command"]),
+        handler=handler,
+        required_keys=["command"],
+        is_read_only=False,
+    )
+    registry = ToolRegistry()
+    registry.register(tool)
+    context = _context(tmp_path, monkeypatch)
+    context.config.policy.hitl_mode = "never"
+    context.config.agent.exploration_tool_call_limit = 2
+
+    results = asyncio.run(
+        ToolExecutor(registry).execute_all(
+            [
+                _call("bash", {"command": "echo first"}, "call_1"),
+                _call("bash", {"command": "echo second"}, "call_2"),
+            ],
+            context,
+        )
+    )
+
+    assert "exploration guard" not in results[0].content
+    assert "exploration guard" in results[1].content
+    assert "converge" in results[1].content

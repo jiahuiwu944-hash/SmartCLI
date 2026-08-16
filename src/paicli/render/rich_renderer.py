@@ -91,10 +91,11 @@ class RichRenderer:
 
         _ = model, provider, cwd, tools, mcp_servers, skills, agents_files, hitl_mode
 
+        palette = _startup_palette(self.console)
         self.console.print()
         self.console.print(top)
-        self.console.print(Align.right(Text("? for shortcuts", style="dim")))
-        self.console.rule(style="grey23")
+        self.console.print(Align.right(Text("? for shortcuts", style=palette["text"])))
+        self.console.rule(style=palette["border"])
         self.console.print()
 
     def handle(self, event: dict[str, Any]) -> None:
@@ -464,17 +465,23 @@ class RichRenderer:
         self._last_has_usage = has_usage
 
     def _identity_panel(self, *, version: str, api_key_configured: bool) -> Table:
-        logo = Text("\n".join(_PI_LOGO), style="bold #a8ff60")
+        logo = Text()
+        colors = _logo_colors(self.console)
+        for idx, row in enumerate(_PI_LOGO):
+            if idx:
+                logo.append("\n")
+            logo.append(row, style=f"bold {colors[idx % len(colors)]}")
+        palette = _startup_palette(self.console)
         identity = Text()
-        identity.append("SmartCLI ", style="bold white")
-        identity.append(f"v{version}", style="dim")
+        identity.append("SmartCLI ", style=palette["title"])
+        identity.append(f"v{version}", style=palette["text"])
         identity.append("\n\n")
         if api_key_configured:
-            identity.append("Signed in ", style="bold white")
-            identity.append("API Key", style="dim")
+            identity.append("Signed in ", style=palette["signed_in"])
+            identity.append("API Key", style=palette["text"])
         else:
             identity.append("Missing ", style="bold red")
-            identity.append("API Key", style="dim")
+            identity.append("API Key", style=palette["text"])
 
         grid = Table.grid(padding=(0, 2))
         grid.add_column(no_wrap=True)
@@ -483,33 +490,103 @@ class RichRenderer:
         return grid
 
     def _release_panel(self, *, version: str) -> Panel:
+        palette = _startup_palette(self.console)
         notes = Text()
         for line in [
             "π logo home layout for the interactive CLI",
             "MCP, skills, tools, and workspace status at a glance",
             "Use /help for commands and /config for runtime settings",
         ]:
-            notes.append("- ", style="dim")
-            notes.append(line, style="dim")
+            notes.append("- ", style=palette["text"])
+            notes.append(line, style=palette["text"])
             notes.append("\n")
-        notes.append("/help", style="purple")
-        notes.append(" for more", style="dim")
+        notes.append("/help", style=palette["help"])
+        notes.append(" for more", style=palette["text"])
         return Panel(
             notes,
-            title=Text(f"What's new (v{version})", style="bold green"),
-            border_style="grey37",
+            title=Text(f"What's new (v{version})", style=palette["whats_new"]),
+            border_style=palette["border"],
             box=box.ROUNDED,
             padding=(0, 2),
         )
 
 
+# Startup banner palette. Rich never downgrades hex colors, so `#rrggbb`
+# styles always emit truecolor (38;2) escapes even on 16-color and
+# 256-color terminals (legacy Windows consoles, cmd.exe, PowerShell without
+# truecolor) cannot parse - such rows fall back to the default gray
+# foreground. Truecolor terminals get the exact hex palette; everything
+# else gets the named 16-color equivalents below, which every
+# color-capable terminal understands.
+_STARTUP_PALETTE_HEX = {
+    "title": "bold #F4F4F5",
+    "text": "#71717A",
+    "signed_in": "bold #34D399",
+    "whats_new": "bold #22D3EE",
+    "help": "#A78BFA",
+    "border": "#3f3f46",
+}
+
+_STARTUP_PALETTE_ANSI = {
+    "title": "bold bright_white",
+    "text": "bright_black",
+    "signed_in": "bold bright_green",
+    "whats_new": "bold bright_cyan",
+    "help": "bright_magenta",
+    "border": "bright_black",
+}
+
+
+def _startup_palette(console: Console) -> dict[str, str]:
+    """Pick startup-banner styles that the active terminal can actually render."""
+    if (console.color_system or "").lower() == "truecolor":
+        return _STARTUP_PALETTE_HEX
+    return _STARTUP_PALETTE_ANSI
+
+
+# Violet-to-teal gradient for the π logo. Rich never downgrades hex colors,
+# so `#rrggbb` styles always emit truecolor (38;2) escapes that 16-color
+# and 256-color terminals (legacy Windows consoles, cmd.exe, PowerShell
+# without truecolor) cannot parse - such rows fall back to the default gray
+# foreground. Only terminals reporting truecolor support get the hex
+# gradient; everything else gets the bright 16-color palette below, which
+# every color-capable terminal understands.
+_LOGO_COLORS_HEX = (
+    "#A78BFA",  # violet
+    "#938CF5",  # periwinkle
+    "#7C9FF2",  # blue-violet
+    "#60B7EC",  # sky blue
+    "#45C7DF",  # cyan
+    "#2DD4BF",  # teal
+)
+
+_LOGO_COLORS_ANSI = (
+    "bright_magenta",
+    "bright_blue",
+    "bright_cyan",
+)
+
+
+def _logo_colors(console: Console) -> tuple[str, ...]:
+    """Pick logo colors that the active terminal can actually render.
+
+    Rich 15 emits truecolor 38;2 escapes for any hex style, even when the
+    console reports a 16-color or 256-color system, so hex gradients go
+    gray on such terminals. Named ANSI colors emit universal 30-37/90-97
+    codes that every color-capable terminal understands.
+    """
+    if (console.color_system or "").lower() == "truecolor":
+        return _LOGO_COLORS_HEX
+    return _LOGO_COLORS_ANSI
+
+
 _PI_LOGO = (
-    "████████████",
-    "  ██    ██  ",
-    "  ██    ██  ",
-    "  ██    ██  ",
-    "  ██    ██  ",
-    "  ██    ██  ",
+    "██████████████",
+    "   ██    ██   ",
+    "   ██    ██   ",
+    "   ██    ██   ",
+    "   ██    ██   ",
+    "   ██    ██   ",
 )
 
 
@@ -547,12 +624,24 @@ def _tool_result_preview(name: str, result: str, *, is_error: bool) -> str:
         details.append("latest source loaded into Agent context")
         return " · ".join(details) + "."
 
-    line_count = len(result.splitlines())
-    return (
-        f"{line_count} lines / {len(result):,} characters returned to Agent context. "
-        "Full result hidden from terminal."
-    )
+    if name == "search_code":
+        try:
+            payload = json.loads(result)
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        matches = payload.get("matches") if isinstance(payload, dict) else []
+        count = len(matches) if isinstance(matches, list) else 0
+        query = str(payload.get("query") or "query") if isinstance(payload, dict) else "query"
+        suffix = " (truncated)" if isinstance(payload, dict) and payload.get("truncated") else ""
+        return f"Search {query}: {count} candidate match(es){suffix}."
 
+    if name in ("grep", "glob", "glob_files", "repo_map", "document_symbols"):
+        lines = [line for line in result.splitlines() if line.strip()]
+        if not lines:
+            return "No matches."
+        return f"{len(lines)} line(s): {lines[0][:200]}{' …' if len(lines) > 1 else ''}."
+
+    return result or "(empty result)"
 
 def _output_panel(renderable: Any, *, title: Text, border_style: str) -> Panel:
     return Panel(

@@ -35,6 +35,7 @@ class AgentConfig:
     max_runtime_seconds: float = 900.0
     repeated_tool_call_limit: int = 3
     consecutive_tool_error_limit: int = 3
+    exploration_tool_call_limit: int = 10
     stop_hook_enabled: bool = True
     stop_hook_max_retries: int = 2
     budget_extension_turns: int = 20
@@ -50,6 +51,7 @@ class ToolsConfig:
     max_concurrent_read: int = 4
     file_version_check: str = "warn"
     atomic_file_write: bool = True
+    shell_source_write_guard: bool = True
 
 
 @dataclass(slots=True)
@@ -63,6 +65,12 @@ class MemoryConfig:
     max_conversation_history: int = 100
     long_term_enabled: bool = True
     long_term_db_path: str = "~/.paicli/memory.db"
+    long_term_recall_limit: int = 5
+    long_term_min_score: float = 1.0
+    long_term_prompt_max_chars: int = 3000
+    auto_memory_enabled: bool = True
+    auto_memory_min_confidence: float = 0.8
+    auto_memory_max_candidates: int = 3
     token_budget_mode: str = "balanced"
     short_term_enabled: bool = True
     warning_threshold: float = 0.65
@@ -239,6 +247,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("PAICLI_AGENT_MAX_SECONDS", "max_runtime_seconds", float),
         ("PAICLI_AGENT_REPEAT_LIMIT", "repeated_tool_call_limit", int),
         ("PAICLI_AGENT_ERROR_LIMIT", "consecutive_tool_error_limit", int),
+        ("PAICLI_AGENT_EXPLORATION_LIMIT", "exploration_tool_call_limit", int),
         ("PAICLI_STOP_HOOK", "stop_hook_enabled", _parse_bool),
         ("PAICLI_STOP_HOOK_RETRIES", "stop_hook_max_retries", int),
         ("PAICLI_AGENT_EXTENSION_TURNS", "budget_extension_turns", int),
@@ -253,6 +262,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     tool_mappings: list[tuple[str, str, Any]] = [
         ("PAICLI_FILE_VERSION_CHECK", "file_version_check", str),
         ("PAICLI_ATOMIC_FILE_WRITE", "atomic_file_write", _parse_bool),
+        ("PAICLI_SHELL_SOURCE_WRITE_GUARD", "shell_source_write_guard", _parse_bool),
     ]
     for env_key, config_key, caster in tool_mappings:
         raw = env.get(env_key)
@@ -261,6 +271,13 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
                 tools[config_key] = caster(raw)
 
     memory_mappings: list[tuple[str, str, Any]] = [
+        ("PAICLI_LONG_TERM_MEMORY", "long_term_enabled", _parse_bool),
+        ("PAICLI_MEMORY_RECALL_LIMIT", "long_term_recall_limit", int),
+        ("PAICLI_MEMORY_MIN_SCORE", "long_term_min_score", float),
+        ("PAICLI_MEMORY_PROMPT_MAX_CHARS", "long_term_prompt_max_chars", int),
+        ("PAICLI_AUTO_MEMORY", "auto_memory_enabled", _parse_bool),
+        ("PAICLI_AUTO_MEMORY_MIN_CONFIDENCE", "auto_memory_min_confidence", float),
+        ("PAICLI_AUTO_MEMORY_MAX_CANDIDATES", "auto_memory_max_candidates", int),
         ("PAICLI_SHORT_TERM_MEMORY", "short_term_enabled", _parse_bool),
         ("PAICLI_CONTEXT_WARNING_THRESHOLD", "warning_threshold", float),
         ("PAICLI_CONTEXT_COMPRESSION_THRESHOLD", "compression_threshold", float),

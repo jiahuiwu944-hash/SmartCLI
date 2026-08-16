@@ -16,11 +16,29 @@ class Skill:
     source: str = "project"
     version: str = ""
     tags: list[str] = field(default_factory=list)
+    requires_tools: list[str] = field(default_factory=list)
+    requires_mcp: list[str] = field(default_factory=list)
     enabled: bool = True
 
     @property
     def body(self) -> str:
         return _strip_frontmatter(self.content).strip()
+
+    def resource_names(self, limit: int = 50) -> list[str]:
+        """Return lazily readable files shipped beside SKILL.md."""
+        root = self.path.parent.resolve()
+        names: list[str] = []
+        for directory in ("references", "templates", "examples"):
+            candidate = root / directory
+            if not candidate.is_dir():
+                continue
+            for path in sorted(candidate.rglob("*")):
+                if not path.is_file() or path.is_symlink():
+                    continue
+                names.append(path.relative_to(root).as_posix())
+                if len(names) >= limit:
+                    return names
+        return names
 
 
 class SkillContextBuffer:
@@ -37,6 +55,10 @@ class SkillContextBuffer:
         while len(self._items) > self.limit:
             self._items.popitem(last=False)
 
+    def start_task(self) -> None:
+        """Prevent instructions loaded by an earlier task leaking into a new task."""
+        self.clear()
+
     def drain(self) -> str:
         if not self._items:
             return ""
@@ -47,6 +69,10 @@ class SkillContextBuffer:
         ]
         self._items.clear()
         return "\n\n".join(chunks)
+
+    def drain_pending(self) -> str:
+        """Consume skills that must be injected before the next model turn."""
+        return self.drain()
 
     def clear(self) -> None:
         self._items.clear()
@@ -195,6 +221,8 @@ class SkillRegistry:
             description=description,
             version=metadata.get("version") or "",
             tags=tags,
+            requires_tools=_parse_tags(metadata.get("requires.tools", "")),
+            requires_mcp=_parse_tags(metadata.get("requires.mcp", "")),
             source=source,
             path=path,
             content=content,
@@ -210,16 +238,23 @@ def _parse_frontmatter(content: str) -> dict[str, str]:
         return {}
     lines = match.group(1).splitlines()
     metadata: dict[str, str] = {}
+    section = ""
     index = 0
     while index < len(lines):
         raw_line = lines[index]
         if ":" not in raw_line:
             index += 1
             continue
+        indent = len(raw_line) - len(raw_line.lstrip())
         key, value = raw_line.split(":", 1)
         key = key.strip()
         value = value.strip()
+        if indent and section:
+            key = f"{section}.{key}"
+        elif not indent:
+            section = key if not value else ""
         if value == "|":
+            section = ""
             index += 1
             block: list[str] = []
             while index < len(lines) and (lines[index].startswith(" ") or not lines[index].strip()):

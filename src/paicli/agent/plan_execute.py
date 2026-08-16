@@ -10,6 +10,7 @@ from paicli.agent.query import query
 from paicli.agent.verifier import CompletionVerifier
 from paicli.config import PaiCliConfig
 from paicli.llm.base import LlmClient
+from paicli.memory import MemoryManager, capture_approved_memories
 from paicli.plan import ExecutionPlan, Planner, Task, TaskStatus
 from paicli.prompt import PromptAssembler
 from paicli.runtime.budget import BudgetManager
@@ -193,6 +194,39 @@ class PlanExecuteAgent:
                 "mode": "plan",
             }
             if verdict.approved:
+                if (
+                    self.config.features.memory
+                    and self.config.memory.long_term_enabled
+                    and self.config.memory.auto_memory_enabled
+                    and verdict.memory_candidates
+                ):
+                    try:
+                        report = capture_approved_memories(
+                            MemoryManager(
+                                self.config.memory.long_term_db_path,
+                                scope=self.cwd,
+                            ),
+                            verdict.memory_candidates,
+                            original_request=plan.goal,
+                            messages=evidence,
+                            min_confidence=self.config.memory.auto_memory_min_confidence,
+                            max_candidates=self.config.memory.auto_memory_max_candidates,
+                        )
+                        yield {
+                            "type": "memory_capture",
+                            "stored_ids": report.stored_ids,
+                            "actions": [item.action for item in report.mutations],
+                            "rejected": report.rejected,
+                            "mode": "plan",
+                        }
+                    except Exception as exc:  # noqa: BLE001
+                        yield {
+                            "type": "memory_capture",
+                            "stored_ids": [],
+                            "actions": [],
+                            "rejected": [f"memory persistence failed: {exc}"],
+                            "mode": "plan",
+                        }
                 plan.mark_completed()
                 state.status = "COMPLETED"
                 yield {"type": "text_delta", "text": final_result}
@@ -249,7 +283,8 @@ class PlanExecuteAgent:
                 config=self.config,
                 approval_callback=self.approval_callback,
                 tool_hook_manager=self.tool_hook_manager,
-                skill_context_buffer=self.skill_context_buffer,
+                # Planned tasks may execute concurrently; each task owns its skill lifecycle.
+                skill_context_buffer=SkillContextBuffer(),
                 max_turns=self.max_task_turns,
                 stop_hook_enabled=False,
             ):
@@ -393,6 +428,10 @@ def _save_plan_state(
 
 def _plan_evidence(plan: ExecutionPlan) -> list[Message]:
     return [
-        Message(role="tool", content=f"Task {task.id} status={task.status.value}: {task.result}")
+        Message(
+            role="tool",
+            tool_call_id=f"plan_{task.id}",
+            content=f"Task {task.id} status={task.status.value}: {task.result}",
+        )
         for task in plan.all_tasks()
     ]

@@ -20,6 +20,8 @@ class McpServerSpec:
     headers: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
     timeout: float = 30.0
+    max_retries: int = 1
+    retry_base_delay: float = 0.25
 
 
 def load_mcp_server_specs(project_root: str | Path) -> dict[str, McpServerSpec]:
@@ -53,7 +55,9 @@ def write_chrome_devtools_config(
     path = config_dir / "mcp.json"
     data = _read_json(path) or {"mcpServers": {}}
     servers = data.setdefault("mcpServers", {})
-    args = ["-y", "chrome-devtools-mcp@latest"]
+    # Isolated mode uses a temporary browser profile per server process. This prevents
+    # multiple SmartCLI windows from fighting over Chrome DevTools MCP's default profile.
+    args = ["-y", "chrome-devtools-mcp@latest", "--isolated"]
     if no_usage_statistics:
         args.append("--no-usage-statistics")
     if slim:
@@ -103,6 +107,8 @@ def _spec_from_raw(name: str, raw: dict[str, Any], project_root: Path) -> McpSer
         },
         enabled=bool(raw.get("enabled", True)),
         timeout=float(raw.get("timeout", raw.get("startup_timeout", 30.0)) or 30.0),
+        max_retries=max(0, int(raw.get("max_retries", 1) or 0)),
+        retry_base_delay=max(0.0, float(raw.get("retry_base_delay", 0.25) or 0.0)),
     )
 
 

@@ -57,6 +57,19 @@ def test_search_code_uses_structured_results_and_gitignore(tmp_path):
     assert any(item.reason in {"exact symbol match", "ripgrep text match"} for item in results)
 
 
+def test_search_code_tool_result_includes_original_query(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "main.py").write_text("class ToolExecutor:\n    pass\n", encoding="utf-8")
+    context = ToolContext(cwd=str(tmp_path), config=load_config(project_root=tmp_path))
+    tool = next(item for item in get_builtin_tools() if item.name == "search_code")
+
+    result = asyncio.run(tool.execute({"query": "ToolExecutor", "mode": "auto"}, context))
+    payload = json.loads(result.content)
+
+    assert payload["query"] == "ToolExecutor"
+    assert payload["matches"]
+
+
 def test_search_code_unifies_symbol_text_and_reference_modes(tmp_path):
     source_dir = tmp_path / "src"
     source_dir.mkdir()
@@ -93,6 +106,7 @@ def test_navigation_tool_surface_uses_unified_search_entry():
     assert "find_symbol" not in names
     assert "find_references" not in names
     assert "grep_code" not in names
+    assert "grep" not in names
 
 
 def test_search_code_rejects_removed_fts_mode(tmp_path):

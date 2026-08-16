@@ -109,21 +109,6 @@ def get_builtin_tools() -> list[Tool]:
             handler=glob_files,
         ),
         Tool(
-            name="grep",
-            description="Search text in workspace files.",
-            parameters=object_schema(
-                {
-                    "pattern": {"type": "string", "description": "Regex or plain text pattern"},
-                    "path": {"type": "string", "description": "Optional path to search"},
-                    "regex": {"type": "boolean", "description": "Treat pattern as regex"},
-                    "limit": {"type": "number", "description": "Maximum matches"},
-                },
-                ["pattern"],
-            ),
-            required_keys=["pattern"],
-            handler=grep,
-        ),
-        Tool(
             name="bash",
             description=_shell_tool_description(),
             parameters=object_schema(
@@ -187,9 +172,44 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="save_memory",
-            description="Save a stable fact to long-term project memory.",
+            description=(
+                "Save a verified, stable cross-session fact to project memory. Do not save "
+                "secrets, guesses, raw tool output, or temporary task progress."
+            ),
             parameters=object_schema(
-                {"content": {"type": "string", "description": "Fact to remember"}},
+                {
+                    "content": {"type": "string", "description": "Concise fact to remember"},
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "fact",
+                            "preference",
+                            "project",
+                            "decision",
+                            "constraint",
+                            "solution",
+                        ],
+                        "description": "Memory category; defaults to fact",
+                    },
+                      "importance": {
+                          "type": "number",
+                          "description": "Long-term importance from 0.0 to 1.0",
+                      },
+                      "key": {
+                          "type": "string",
+                          "description": (
+                              "Optional stable dotted key used to replace an older fact"
+                          ),
+                      },
+                      "confidence": {
+                          "type": "number",
+                          "description": "Evidence-backed confidence from 0.0 to 1.0",
+                      },
+                      "evidence": {
+                          "type": "string",
+                          "description": "Concise source or verification evidence",
+                      },
+                },
                 ["content"],
             ),
             required_keys=["content"],
@@ -199,14 +219,56 @@ def get_builtin_tools() -> list[Tool]:
             danger_level="medium",
         ),
         Tool(
+            name="search_memory",
+            description=(
+                "Search relevant long-term memories for this project. Returned facts may be "
+                "stale and must be verified before changing code."
+            ),
+            parameters=object_schema(
+                {
+                    "query": {"type": "string", "description": "Memory search query"},
+                    "limit": {"type": "number", "description": "Maximum results"},
+                },
+                ["query"],
+            ),
+            required_keys=["query"],
+            handler=search_memory,
+        ),
+        Tool(
             name="load_skill",
-            description="Load a named SmartCLI skill manual from user/project skill directories.",
+            description=(
+                "Activate a named SmartCLI skill for the current task. The instructions are "
+                "injected before the next ReAct turn."
+            ),
             parameters=object_schema(
                 {"name": {"type": "string", "description": "Skill name"}},
                 ["name"],
             ),
             required_keys=["name"],
             handler=load_skill,
+        ),
+        Tool(
+            name="read_skill_resource",
+            description=(
+                "Read one reference, template, or example advertised by an activated skill. "
+                "Use this only when the core SKILL.md instructions require that resource."
+            ),
+            parameters=object_schema(
+                {
+                    "name": {"type": "string", "description": "Skill name"},
+                    "path": {
+                        "type": "string",
+                        "description": "Relative resource path shown by load_skill",
+                    },
+                    "max_chars": {
+                        "type": "number",
+                        "description": "Maximum characters to return; defaults to 8000",
+                    },
+                },
+                ["name", "path"],
+            ),
+            required_keys=["name", "path"],
+            handler=read_skill_resource,
         ),
         Tool(
             name="search_code",
@@ -369,6 +431,34 @@ async def write_file(payload: dict[str, Any], context: ToolContext) -> ToolResul
             display_summary=f"Version required {relative_path}",
         )
 
+    incomplete_read = _incomplete_read_for_destructive_overwrite(
+        context=context,
+        relative_path=relative_path,
+        current_content=current_content,
+        desired_content=desired_content,
+        current_version=current_version,
+        append=append,
+    )
+    if incomplete_read:
+        return ToolResult(
+            _file_result(
+                "FILE_READ_INCOMPLETE",
+                relative_path,
+                actual_version=current_version,
+                current_size=len(current_content),
+                requested_size=len(desired_content),
+                retryable=True,
+                suggested_action=(
+                    "This overwrite would remove a large portion of an existing file, but the "
+                    "current file version was only read partially. Read the complete file with "
+                    "read_file (one or more contiguous ranges), regenerate the full content, and "
+                    "retry with the same expected_version."
+                ),
+            ),
+            is_error=True,
+            display_summary=f"Complete read required {relative_path}",
+        )
+
     warning = None
     if check_mode == "warn" and expected_version is None and current_version != MISSING_VERSION:
         warning = "Existing file was written without expected_version."
@@ -404,6 +494,31 @@ async def write_file(payload: dict[str, Any], context: ToolContext) -> ToolResul
 def _file_version_check_mode(context: ToolContext) -> str:
     mode = str(context.config.tools.file_version_check or "warn").lower()
     return mode if mode in {"off", "warn", "enforce"} else "warn"
+
+
+def _incomplete_read_for_destructive_overwrite(
+    *,
+    context: ToolContext,
+    relative_path: Path,
+    current_content: bytes,
+    desired_content: bytes,
+    current_version: str,
+    append: bool,
+) -> bool:
+    """Guard against replacing a whole file with a partially read excerpt."""
+
+    ledger = context.context_ledger
+    if append or ledger is None or len(current_content) < 4 * 1024:
+        return False
+    if len(desired_content) * 100 >= len(current_content) * 80:
+        return False
+    line_count = len(current_content.decode("utf-8", errors="replace").splitlines())
+    return not ledger.covers(
+        str(relative_path),
+        1,
+        max(1, line_count),
+        current_version,
+    )
 
 
 def _version_conflict_result(
@@ -480,7 +595,7 @@ async def grep(payload: dict[str, Any], context: ToolContext) -> ToolResult:
         )
     except (RuntimeError, re.error) as exc:
         return ToolResult(f"grep failed: {exc}", is_error=True)
-    return ToolResult(_search_result_json(matches, truncated=truncated))
+    return ToolResult(_search_result_json(matches, truncated=truncated, query=pattern))
 
 
 async def bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -513,6 +628,8 @@ def _shell_tool_description() -> str:
     shell = "Windows Command Prompt (cmd.exe)" if os.name == "nt" else "/bin/sh"
     return (
         f"Execute a command with {shell} in the current workspace. "
+        "Use it for tests, diagnostics, builds, and read-only inspection; do not use shell "
+        "redirection or patch scripts to modify workspace source files. "
         "A non-zero exit code is reported as an error; when a probe may legitimately find "
         "nothing, print a clear no-match result and exit successfully."
     )
@@ -572,17 +689,60 @@ async def save_memory(payload: dict[str, Any], context: ToolContext) -> ToolResu
     if not context.config.features.memory or not context.config.memory.long_term_enabled:
         return ToolResult("Long-term memory is disabled.", is_error=True)
     manager = MemoryManager(context.config.memory.long_term_db_path, scope=context.cwd)
-    memory_id = manager.save(str(payload["content"]))
-    return ToolResult(f"Saved memory #{memory_id}")
+    try:
+        memory_id = manager.save(
+            str(payload["content"]),
+            category=str(payload.get("category") or "fact"),
+            importance=payload.get("importance", 0.5),
+            source="agent",
+            memory_key=str(payload.get("key") or ""),
+            confidence=payload.get("confidence", 0.5),
+            evidence=str(payload.get("evidence") or ""),
+        )
+    except ValueError as exc:
+        return ToolResult(str(exc), is_error=True)
+    return ToolResult(f"Saved or refreshed memory #{memory_id}")
+
+
+async def search_memory(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    if not context.config.features.memory or not context.config.memory.long_term_enabled:
+        return ToolResult("Long-term memory is disabled.", is_error=True)
+    manager = MemoryManager(context.config.memory.long_term_db_path, scope=context.cwd)
+    limit = max(1, min(20, int(payload.get("limit") or 5)))
+    memories = manager.search(str(payload["query"]), limit=limit)
+    if not memories:
+        return ToolResult("No relevant project memories found.")
+    lines = [
+        f"#{item.id} [{item.category}; importance={item.importance:.1f}; "
+        f"confidence={item.confidence:.1f}; key={item.memory_key or '-'}] {item.content}"
+        for item in memories
+    ]
+    return ToolResult(
+        "\n".join(lines),
+        display_summary=f"Recalled {len(memories)} project memories",
+    )
 
 
 async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     skill = SkillRegistry(context.cwd).load(str(payload["name"]))
     if not skill:
         return ToolResult(f'Skill "{payload["name"]}" not found or disabled.', is_error=True)
+    missing = _missing_skill_dependencies(skill, context)
+    if missing:
+        return ToolResult(
+            f'Cannot activate skill "{skill.name}": missing {", ".join(missing)}. '
+            "Use available tools or choose another skill.",
+            is_error=True,
+        )
     content = skill.body or skill.content
     if len(content) > 5_000:
         content = content[:5_000] + "\n... [truncated; use /skill show for the full skill]"
+    resources = skill.resource_names()
+    if resources:
+        content += (
+            "\n\nAvailable skill resources (load only when needed with "
+            "read_skill_resource):\n- " + "\n- ".join(resources)
+        )
     if context.skill_context_buffer:
         context.skill_context_buffer.push(skill.name, content)
         return ToolResult(
@@ -590,6 +750,50 @@ async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResul
             display_summary=f"Loaded skill {skill.name}",
         )
     return ToolResult(content, display_summary=f"Loaded skill {skill.name}")
+
+
+async def read_skill_resource(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    skill = SkillRegistry(context.cwd).load(str(payload["name"]))
+    if not skill:
+        return ToolResult(f'Skill "{payload["name"]}" not found or disabled.', is_error=True)
+    relative = str(payload["path"]).replace("\\", "/").strip()
+    if not relative or Path(relative).is_absolute():
+        return ToolResult("Skill resource path must be relative.", is_error=True)
+    allowed = set(skill.resource_names())
+    if relative not in allowed:
+        return ToolResult(
+            f'Resource "{relative}" is not advertised by skill "{skill.name}".',
+            is_error=True,
+        )
+    root = skill.path.parent.resolve()
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root) or not path.is_file() or path.is_symlink():
+        return ToolResult("Skill resource path is invalid.", is_error=True)
+    limit = max(500, min(20_000, int(payload.get("max_chars") or 8_000)))
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return ToolResult(f"Unable to read skill resource: {exc}", is_error=True)
+    truncated = len(content) > limit
+    if truncated:
+        content = content[:limit] + "\n... [skill resource truncated]"
+    return ToolResult(
+        content,
+        display_summary=f"Read {skill.name}/{relative}" + (" (truncated)" if truncated else ""),
+    )
+
+
+def _missing_skill_dependencies(skill, context: ToolContext) -> list[str]:
+    registry = context.tool_registry
+    if not registry:
+        return []
+    available = set(registry.list_names())
+    missing = [f"tool:{name}" for name in skill.requires_tools if name not in available]
+    for server in skill.requires_mcp:
+        prefix = f"mcp__{server}__"
+        if not any(name.startswith(prefix) for name in available):
+            missing.append(f"mcp:{server}")
+    return missing
 
 
 async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -604,7 +808,13 @@ async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResu
         )
     except (RuntimeError, ValueError, re.error) as exc:
         return ToolResult(f"search_code failed: {exc}", is_error=True)
-    return ToolResult(_search_result_json(results, truncated=truncated))
+    return ToolResult(
+        _search_result_json(
+            results,
+            truncated=truncated,
+            query=str(payload["query"]),
+        )
+    )
 
 
 async def repo_map(payload: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -659,9 +869,10 @@ def _navigator(context: ToolContext) -> CodeNavigator:
     return context.code_navigator
 
 
-def _search_result_json(results, *, truncated: bool) -> str:
+def _search_result_json(results, *, truncated: bool, query: str = "") -> str:
     return json.dumps(
         {
+            "query": query,
             "matches": [
                 {
                     "path": item.path,

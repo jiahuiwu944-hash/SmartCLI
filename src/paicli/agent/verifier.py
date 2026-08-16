@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from paicli.agent.stop_hook import verify_answer
 from paicli.llm.base import LlmClient
@@ -13,6 +14,7 @@ class VerificationResult:
     feedback: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
+    memory_candidates: list[dict[str, Any]] | None = None
 
 
 class CompletionVerifier:
@@ -65,6 +67,7 @@ class CompletionVerifier:
             result.feedback,
             result.input_tokens,
             result.output_tokens,
+            result.memory_candidates,
         )
 
 
