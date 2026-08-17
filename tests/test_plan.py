@@ -6,7 +6,13 @@ from typing import Any
 import pytest
 
 from paicli.agent import PlanExecuteAgent
-from paicli.agent.plan_execute import _parse_review, _select_safe_batch
+from paicli.agent.plan_execute import (
+    _build_plan_result,
+    _parse_review,
+    _planner_task_limit,
+    _select_safe_batch,
+    _workspace_inventory,
+)
 from paicli.config import load_config
 from paicli.plan import ExecutionPlan, Planner, Task, TaskStatus, TaskType
 from paicli.tools import ToolRegistry, get_builtin_tools
@@ -113,6 +119,31 @@ def test_failed_dependencies_are_propagated_as_blocked():
     assert blocked == [dependent]
     assert dependent.status == TaskStatus.BLOCKED
     assert "a" in dependent.error
+
+
+def test_failed_team_report_does_not_claim_completion():
+    plan = ExecutionPlan(id="plan", goal="demo")
+    task = Task("a", "A")
+    plan.add_task(task)
+    task.mark_failed("boom")
+
+    result = _build_plan_result(plan, "team")
+
+    assert result.startswith("Multi-Agent task failed.")
+    assert "task completed" not in result.lower()
+
+
+def test_workspace_inventory_exposes_real_module_paths(tmp_path):
+    (tmp_path / "src" / "paicli" / "plan").mkdir(parents=True)
+    (tmp_path / "src" / "paicli" / "skill").mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+
+    inventory = _workspace_inventory(str(tmp_path))
+
+    assert "src/paicli/plan/" in inventory
+    assert "src/paicli/skill/" in inventory
+    assert ".git" not in inventory
+    assert _planner_task_limit(20, review_each_task=True) == 4
 
 
 def test_review_parser_requires_a_real_json_boolean():

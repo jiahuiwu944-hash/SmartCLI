@@ -127,7 +127,15 @@ class PlanExecuteAgent:
                 }
             else:
                 yield {"type": "text_delta", "text": f"Planning task: {message}\n\n"}
-                plan = await self.planner.create_plan(message)
+                planner_task_limit = _planner_task_limit(
+                    self.config.agent.max_turns,
+                    review_each_task=self.policy.review_each_task,
+                )
+                plan = await self.planner.create_plan(
+                    message,
+                    workspace_context=_workspace_inventory(self.cwd),
+                    max_tasks=planner_task_limit,
+                )
                 budget.consume(turns=self.planner.last_turns, tokens=self.planner.last_tokens)
                 if self.planner.last_warning:
                     yield {
@@ -413,8 +421,6 @@ class PlanExecuteAgent:
             min(requested_attempts, turn_allocation // minimum_attempt_turns),
         )
         retry_limit = attempts - 1
-        per_attempt_turns = max(1, turn_allocation // attempts - review_turns)
-        per_attempt_tokens = token_allocation // attempts if token_allocation else 0
         last_error: Exception | None = None
 
         for attempt in range(attempts):
@@ -433,6 +439,16 @@ class PlanExecuteAgent:
             messages: list[Message] = []
             attempt_tokens = 0
             attempt_turns = 0
+            remaining_turns = max(1, turn_allocation - total_turns)
+            future_attempts = attempts - attempt - 1
+            reserved_turns = future_attempts * minimum_attempt_turns
+            per_attempt_turns = max(
+                1, remaining_turns - review_turns - reserved_turns
+            )
+            remaining_tokens = max(0, token_allocation - total_tokens)
+            per_attempt_tokens = (
+                remaining_tokens // (future_attempts + 1) if remaining_tokens else 0
+            )
             try:
                 worker_config = deepcopy(self.config)
                 if per_attempt_tokens:
@@ -489,7 +505,12 @@ class PlanExecuteAgent:
                         attempt_turns += int(event.get("total_turns") or 0)
                         messages = list(event.get("messages") or [])
                     elif event_type == "run_stopped":
-                        raise RuntimeError(str(event.get("message") or "Agent run stopped"))
+                        reason = str(event.get("reason") or "task_budget")
+                        raise RuntimeError(
+                            f"Task attempt reached its local allocation ({reason}, "
+                            f"{per_attempt_turns} turns); retry with the known paths and "
+                            "a more direct approach."
+                        )
                     elif event_type == "error":
                         raise event["error"]
 
@@ -765,6 +786,8 @@ def _task_context(
         f"Goal: {plan.goal}",
         f"Current task [{task.id}]: {task.description}",
         f"Acceptance criteria: {json.dumps(task.acceptance_criteria, ensure_ascii=False)}",
+        f"Declared read paths: {json.dumps(task.read_paths, ensure_ascii=False)}",
+        f"Declared write paths: {json.dumps(task.write_paths, ensure_ascii=False)}",
         "",
         "Completed dependency results:",
     ]
@@ -778,7 +801,14 @@ def _task_context(
 
 
 def _build_plan_result(plan: ExecutionPlan, mode: str) -> str:
-    heading = "Multi-Agent task completed." if mode == "team" else "Plan execution completed."
+    if plan.has_failed():
+        heading = "Multi-Agent task failed." if mode == "team" else "Plan execution failed."
+    else:
+        heading = (
+            "Multi-Agent task completed."
+            if mode == "team"
+            else "Plan execution completed."
+        )
     lines = [heading, "", "Task report:"]
     for task in plan.all_tasks():
         lines.append(f"- [{task.id}] {task.status.value}: {task.description}")
@@ -803,6 +833,53 @@ def _build_synthesized_result(plan: ExecutionPlan, mode: str, synthesis: str) ->
 def _preview(text: str, max_len: int = 240) -> str:
     value = (text or "").replace("\r\n", "\n").strip()
     return value if len(value) <= max_len else value[: max_len - 3] + "..."
+
+
+def _planner_task_limit(turn_limit: int, *, review_each_task: bool) -> int:
+    # Reserve one planner turn and two finalization turns. Team tasks also need a
+    # reviewer turn, so a smaller DAG is materially more useful than many starved tasks.
+    usable = max(1, int(turn_limit) - 3)
+    turns_per_task = 4 if review_each_task else 3
+    return max(1, min(8, usable // turns_per_task))
+
+
+def _workspace_inventory(root: str, *, max_entries: int = 160) -> str:
+    base = Path(root).resolve()
+    excluded = {
+        ".git",
+        ".venv",
+        ".paicli",
+        ".pytest_cache",
+        ".ruff_cache",
+        "__pycache__",
+        "node_modules",
+    }
+    rows: list[str] = []
+
+    def visit(directory: Path, depth: int) -> None:
+        if depth > 3 or len(rows) >= max_entries:
+            return
+        try:
+            children = sorted(
+                directory.iterdir(),
+                key=lambda item: (not item.is_dir(), item.name.casefold()),
+            )
+        except OSError:
+            return
+        for child in children:
+            if child.name in excluded or child.name.startswith("."):
+                continue
+            relative = child.relative_to(base).as_posix()
+            if child.is_dir():
+                rows.append(f"{relative}/")
+                visit(child, depth + 1)
+            elif depth <= 2 or child.name in {"pyproject.toml", "README.md"}:
+                rows.append(relative)
+            if len(rows) >= max_entries:
+                return
+
+    visit(base, 1)
+    return "\n".join(rows) or "(workspace inventory unavailable)"
 
 
 def _parse_review(text: str) -> tuple[bool, str]:

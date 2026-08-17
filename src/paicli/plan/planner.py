@@ -31,6 +31,10 @@ Return only JSON with this shape:
 Use at most 24 tasks. Dependencies must reference unique task IDs from this plan.
 Set parallel_safe=true only for read-only tasks whose declared paths do not conflict.
 Every mutating task must declare its expected write_paths and concrete acceptance criteria.
+When a workspace inventory is supplied, treat its paths as authoritative. Do not invent a
+modules/ layout or create a separate path-discovery step for a path already in the inventory.
+Keep each worker task end-to-end: do not split locating, reading, and analyzing one module into
+separate tasks. A two-module comparison normally needs two independent tasks plus one synthesis.
 """
 
 
@@ -41,7 +45,13 @@ class Planner:
         self.last_turns = 0
         self.last_warning = ""
 
-    async def create_plan(self, goal: str) -> ExecutionPlan:
+    async def create_plan(
+        self,
+        goal: str,
+        *,
+        workspace_context: str = "",
+        max_tasks: int = 8,
+    ) -> ExecutionPlan:
         self.last_tokens = 0
         self.last_turns = 0
         self.last_warning = ""
@@ -50,8 +60,14 @@ class Planner:
         failure = ""
         for attempt in range(2):
             correction = (
-                "\n\nThe previous response was empty or invalid. Return the JSON plan now."
+                "\n\nThe previous response was invalid: "
+                f"{failure}. Return a corrected JSON plan now."
                 if attempt
+                else ""
+            )
+            inventory = (
+                f"\n\nAuthoritative workspace inventory:\n{workspace_context}"
+                if workspace_context
                 else ""
             )
             text, tokens = await _collect_text(
@@ -60,7 +76,8 @@ class Planner:
                     Message(
                         role="user",
                         content=(
-                            f"Please create an execution plan for:\n{goal}{correction}"
+                            f"Please create an execution plan for:\n{goal}\n\n"
+                            f"Use at most {max(1, max_tasks)} tasks.{inventory}{correction}"
                         ),
                     )
                 ],
@@ -69,7 +86,7 @@ class Planner:
             self.last_tokens += tokens
             self.last_turns += 1
             try:
-                return self.parse_plan(goal, text)
+                return self.parse_plan(goal, text, task_limit=max_tasks)
             except (ValueError, json.JSONDecodeError) as exc:
                 failure = str(exc)
         self.last_warning = (
@@ -88,13 +105,16 @@ class Planner:
             f"{failed_plan.goal}\nFailure reason: {failure_reason}\nCompleted tasks:\n{completed}"
         )
 
-    def parse_plan(self, goal: str, plan_json: str) -> ExecutionPlan:
+    def parse_plan(
+        self, goal: str, plan_json: str, *, task_limit: int = 24
+    ) -> ExecutionPlan:
         data = _parse_json_object(plan_json)
         task_nodes = data.get("tasks") or data.get("steps") or []
         if not isinstance(task_nodes, list) or not task_nodes:
             raise ValueError("planner output did not contain a non-empty tasks/steps array")
-        if len(task_nodes) > 24:
-            raise ValueError("planner output exceeds the 24-task limit")
+        limit = max(1, min(24, task_limit))
+        if len(task_nodes) > limit:
+            raise ValueError(f"planner output exceeds the {limit}-task limit")
 
         plan = ExecutionPlan(id=f"plan_{int(time.time() * 1000)}", goal=goal)
         plan.summary = str(data.get("summary") or "")
