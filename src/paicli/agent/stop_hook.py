@@ -81,25 +81,48 @@ async def verify_answer(
         f"Proposed final answer:\n{proposed_answer or '(empty)'}\n\n"
         f"Recent tool evidence:\n{evidence or '(none)'}"
     )
-    text = ""
     input_tokens = 0
     output_tokens = 0
-    async for event in llm_client.chat(
-        [Message(role="user", content=payload)],
-        [],
-        system_prompt=STOP_HOOK_SYSTEM_PROMPT,
-    ):
-        event_type = event.get("type")
-        if event_type == "text_delta":
-            text += str(event.get("text") or "")
-        elif event_type == "usage":
-            usage = event.get("usage") or {}
-            input_tokens += int(usage.get("input_tokens") or 0)
-            output_tokens += int(usage.get("output_tokens") or 0)
-        elif event_type == "error":
+    review_messages = [Message(role="user", content=payload)]
+    text, used_input, used_output, error = await _collect_review(
+        llm_client, review_messages
+    )
+    input_tokens += used_input
+    output_tokens += used_output
+    if error:
+        return StopHookResult(
+            approved=False,
+            feedback=f"Stop Hook failed: {error}",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            raw=text,
+        )
+
+    # An otherwise successful provider stream can occasionally contain only reasoning or
+    # malformed prose. Retry the verdict itself instead of making the worker redo valid work.
+    if not _contains_verdict(text):
+        review_messages.extend(
+            [
+                Message(role="assistant", content=text or "(empty response)"),
+                Message(
+                    role="user",
+                    content=(
+                        "Your verdict was empty or invalid. Return exactly one JSON object "
+                        "with a JSON boolean approved field, feedback, and memories."
+                    ),
+                ),
+            ]
+        )
+        retry_text, used_input, used_output, error = await _collect_review(
+            llm_client, review_messages
+        )
+        input_tokens += used_input
+        output_tokens += used_output
+        text = retry_text
+        if error:
             return StopHookResult(
                 approved=False,
-                feedback=f"Stop Hook failed: {event.get('error')}",
+                feedback=f"Stop Hook failed: {error}",
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 raw=text,
@@ -113,6 +136,40 @@ async def verify_answer(
         output_tokens=output_tokens,
         raw=text,
         memory_candidates=_parse_memory_candidates(text) if verdict[0] else [],
+    )
+
+
+async def _collect_review(
+    llm_client: LlmClient, messages: list[Message]
+) -> tuple[str, int, int, Any | None]:
+    text = ""
+    input_tokens = 0
+    output_tokens = 0
+    try:
+        async for event in llm_client.chat(
+            messages,
+            [],
+            system_prompt=STOP_HOOK_SYSTEM_PROMPT,
+        ):
+            event_type = event.get("type")
+            if event_type == "text_delta":
+                text += str(event.get("text") or "")
+            elif event_type == "usage":
+                usage = event.get("usage") or {}
+                input_tokens += int(usage.get("input_tokens") or 0)
+                output_tokens += int(usage.get("output_tokens") or 0)
+            elif event_type == "error":
+                return text, input_tokens, output_tokens, event.get("error")
+    except Exception as exc:  # noqa: BLE001
+        return text, input_tokens, output_tokens, exc
+    return text, input_tokens, output_tokens, None
+
+
+def _contains_verdict(text: str) -> bool:
+    if _decoded_verdicts(text.strip()):
+        return True
+    return bool(
+        re.search(r'["\']?approved["\']?\s*:\s*(true|false)\b', text, re.IGNORECASE)
     )
 
 

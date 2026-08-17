@@ -799,6 +799,35 @@ class ApprovingReviewClient:
         yield {"type": "message_end", "stop_reason": "end_turn"}
 
 
+class EmptyThenApprovingReviewClient(ApprovingReviewClient):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        self.calls += 1
+        if self.calls == 2:
+            assert "empty or invalid" in str(messages[-1].content)
+            yield {"type": "text_delta", "text": '{"approved": true, "feedback": ""}'}
+        yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+def test_stop_hook_retries_only_its_verdict_after_an_empty_stream():
+    client = EmptyThenApprovingReviewClient()
+
+    result = asyncio.run(
+        verify_answer(
+            llm_client=client,
+            original_request="summarize",
+            proposed_answer="summary",
+            messages=[],
+        )
+    )
+
+    assert result.approved is True
+    assert client.calls == 2
+
+
 def test_stop_hook_allows_honest_partial_completion_after_a_block():
     result = asyncio.run(
         verify_answer(

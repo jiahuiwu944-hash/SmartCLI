@@ -120,6 +120,30 @@ def test_review_parser_requires_a_real_json_boolean():
     assert not _parse_review('{"approved": "false", "issues": []}')[0]
 
 
+def test_planner_retries_an_empty_successful_stream():
+    client = EmptyThenValidPlannerClient()
+    planner = Planner(client)
+
+    plan = asyncio.run(planner.create_plan("先检查 Plan，然后给出结论"))
+
+    assert client.calls == 2
+    assert planner.last_turns == 2
+    assert plan.get_task("task_1").description == "Inspect Plan"
+    assert planner.last_warning == ""
+
+
+def test_planner_uses_parallel_fallback_after_repeated_empty_streams():
+    planner = Planner(AlwaysEmptyPlannerClient())
+
+    plan = asyncio.run(planner.create_plan("并行检查 Plan 和 Skill 模块"))
+
+    assert planner.last_warning
+    assert len(plan.all_tasks()) == 3
+    assert plan.get_task("task_1").parallel_safe
+    assert plan.get_task("task_2").parallel_safe
+    assert plan.get_task("task_3").dependencies == ["task_1", "task_2"]
+
+
 def test_plan_execute_runs_independent_tasks_in_parallel(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     client = ParallelPlanClient()
@@ -168,6 +192,28 @@ class FakeClient:
 
     async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
         yield {"type": "text_delta", "text": "{}"}
+        yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+class EmptyThenValidPlannerClient(FakeClient):
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        self.calls += 1
+        if self.calls == 2:
+            yield {
+                "type": "text_delta",
+                "text": (
+                    '{"tasks":[{"id":"a","description":"Inspect Plan",'
+                    '"type":"ANALYSIS","dependencies":[]}]}'
+                ),
+            }
+        yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+class AlwaysEmptyPlannerClient(FakeClient):
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
         yield {"type": "message_end", "stop_reason": "end_turn"}
 
 

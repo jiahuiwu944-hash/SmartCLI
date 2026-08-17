@@ -163,6 +163,10 @@ class RichRenderer:
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
             self._print_llm_retry(event)
+        elif event_type == "planner_fallback":
+            self._flush_thinking()
+            self._flush_markdown(title="Assistant Output")
+            self._print_planner_fallback(event)
         elif event_type == "error":
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
@@ -405,6 +409,16 @@ class RichRenderer:
                     f"Model API Retry · {attempt}/{max_retries}",
                     style="bold #facc15",
                 ),
+                border_style="#facc15",
+            )
+        )
+
+    def _print_planner_fallback(self, event: dict[str, Any]) -> None:
+        message = str(event.get("message") or "Planner fallback activated.")
+        self.console.print(
+            _output_panel(
+                message,
+                title=Text("Planner fallback · execution continues", style="bold #facc15"),
                 border_style="#facc15",
             )
         )

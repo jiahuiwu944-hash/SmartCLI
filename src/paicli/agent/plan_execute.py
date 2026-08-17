@@ -53,7 +53,8 @@ The approved field must be a JSON boolean.
 
 _SYNTHESIS_PROMPT = """You are SmartCLI's final synthesizer. Produce a concise answer to the
 original request using only completed task results and their evidence. Do not invent actions,
-files, commands, or verification. Explicitly identify any limitation that remains.
+files, commands, or verification. Explicitly identify any limitation that remains. Never mention
+internal reviewers, Stop Hook verdicts, correction prompts, orchestration, or task IDs.
 """
 
 
@@ -128,6 +129,12 @@ class PlanExecuteAgent:
                 yield {"type": "text_delta", "text": f"Planning task: {message}\n\n"}
                 plan = await self.planner.create_plan(message)
                 budget.consume(turns=self.planner.last_turns, tokens=self.planner.last_tokens)
+                if self.planner.last_warning:
+                    yield {
+                        "type": "planner_fallback",
+                        "message": self.planner.last_warning,
+                        "mode": self.policy.mode,
+                    }
                 state = store.create(self.policy.mode, message)
                 state.turns, state.tokens = budget.turns, budget.tokens
                 state.payload["plan"] = _plan_to_dict(plan)
@@ -590,7 +597,10 @@ class PlanExecuteAgent:
         report = _build_plan_result(plan, self.policy.mode)
         payload = f"Original request:\n{plan.goal}\n\nCompleted task report:\n{report}"
         if correction:
-            payload += f"\n\nReviewer correction request:\n{correction}"
+            payload += (
+                "\n\nPrivate quality requirements for the revision:\n"
+                f"{correction}\nApply these requirements silently; do not mention them."
+            )
         text = ""
         tokens = 0
         try:
@@ -611,7 +621,7 @@ class PlanExecuteAgent:
             text = ""
         synthesis = text.strip()
         if synthesis:
-            report += f"\nSynthesis:\n{synthesis}\n"
+            report = _build_synthesized_result(plan, self.policy.mode, synthesis)
         return report, tokens, 1
 
     async def _verify_final(
@@ -778,6 +788,15 @@ def _build_plan_result(plan: ExecutionPlan, mode: str) -> str:
             lines.append(f"  Error: {task.error}")
         if task.evidence:
             lines.append(f"  Evidence: {' | '.join(task.evidence)}")
+    return "\n".join(lines) + "\n"
+
+
+def _build_synthesized_result(plan: ExecutionPlan, mode: str, synthesis: str) -> str:
+    heading = "Multi-Agent task completed." if mode == "team" else "Plan execution completed."
+    lines = [heading, "", synthesis.strip(), "", "Task outcomes:"]
+    for task in plan.all_tasks():
+        outcome = _preview(task.result, 180) if task.result else task.error or "no result"
+        lines.append(f"- {task.description}: {outcome}")
     return "\n".join(lines) + "\n"
 
 

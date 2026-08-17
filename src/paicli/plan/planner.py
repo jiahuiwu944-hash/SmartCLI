@@ -39,20 +39,44 @@ class Planner:
         self.llm_client = llm_client
         self.last_tokens = 0
         self.last_turns = 0
+        self.last_warning = ""
 
     async def create_plan(self, goal: str) -> ExecutionPlan:
         self.last_tokens = 0
         self.last_turns = 0
+        self.last_warning = ""
         if _is_simple_goal(goal):
             return _minimal_plan(goal)
-        text, tokens = await _collect_text(
-            self.llm_client,
-            [Message(role="user", content=f"Please create an execution plan for:\n{goal}")],
-            system_prompt=PLANNER_PROMPT,
+        failure = ""
+        for attempt in range(2):
+            correction = (
+                "\n\nThe previous response was empty or invalid. Return the JSON plan now."
+                if attempt
+                else ""
+            )
+            text, tokens = await _collect_text(
+                self.llm_client,
+                [
+                    Message(
+                        role="user",
+                        content=(
+                            f"Please create an execution plan for:\n{goal}{correction}"
+                        ),
+                    )
+                ],
+                system_prompt=PLANNER_PROMPT,
+            )
+            self.last_tokens += tokens
+            self.last_turns += 1
+            try:
+                return self.parse_plan(goal, text)
+            except (ValueError, json.JSONDecodeError) as exc:
+                failure = str(exc)
+        self.last_warning = (
+            f"Planner returned no usable JSON after 2 attempts ({failure}); "
+            "using a safe fallback plan."
         )
-        self.last_tokens = tokens
-        self.last_turns = 1
-        return self.parse_plan(goal, text)
+        return _fallback_plan(goal)
 
     async def replan(self, failed_plan: ExecutionPlan, failure_reason: str) -> ExecutionPlan:
         completed = "\n".join(
@@ -182,6 +206,75 @@ def _minimal_plan(goal: str) -> ExecutionPlan:
     plan.add_task(Task(id="task_1", description=normalized, type=_infer_simple_type(normalized)))
     plan.compute_execution_order()
     return plan
+
+
+def _fallback_plan(goal: str) -> ExecutionPlan:
+    normalized = goal.strip()
+    plan = ExecutionPlan(id=f"plan_{int(time.time() * 1000)}", goal=normalized)
+    match = re.search(
+        r"(?:并行)?(?:检查|分析|审查)\s*(.+?)\s*(?:和|与|、)\s*(.+?)(?:模块)?$",
+        normalized,
+        re.IGNORECASE,
+    )
+    if match:
+        targets = [_clean_target(match.group(1)), _clean_target(match.group(2))]
+        plan.summary = f"安全降级：并行检查 {targets[0]} 与 {targets[1]}"
+        for index, target in enumerate(targets, start=1):
+            plan.add_task(
+                Task(
+                    id=f"task_{index}",
+                    description=(
+                        f"检查 {target}，报告结构、关键实现、风险和可验证的改进建议"
+                    ),
+                    type=TaskType.ANALYSIS,
+                    acceptance_criteria=[f"给出 {target} 的证据化检查结果"],
+                    read_paths=_target_paths(target),
+                    parallel_safe=True,
+                    retry_limit=1,
+                )
+            )
+        plan.add_task(
+            Task(
+                id="task_3",
+                description="汇总两个模块的检查结果，标出共同问题和优先级",
+                type=TaskType.ANALYSIS,
+                dependencies=["task_1", "task_2"],
+                acceptance_criteria=["形成去重、分级且可执行的汇总结论"],
+                retry_limit=1,
+            )
+        )
+    else:
+        plan.summary = "安全降级：直接执行原始任务"
+        plan.add_task(
+            Task(
+                id="task_1",
+                description=normalized,
+                type=_infer_simple_type(normalized),
+                acceptance_criteria=["返回与原始请求直接对应的具体结果"],
+                retry_limit=1,
+            )
+        )
+    errors = plan.validate()
+    if errors:  # pragma: no cover - constructed locally from fixed dependencies
+        raise ValueError("invalid fallback plan: " + "; ".join(errors))
+    return plan
+
+
+def _clean_target(value: str) -> str:
+    cleaned = value.strip(" ：:，,。.")
+    return re.sub(r"\s*模块$", "", cleaned, flags=re.IGNORECASE).strip()
+
+
+def _target_paths(target: str) -> list[str]:
+    normalized = target.casefold()
+    known = {
+        "plan": "src/paicli/plan",
+        "skill": "src/paicli/skill",
+        "agent": "src/paicli/agent",
+        "mcp": "src/paicli/mcp",
+        "memory": "src/paicli/memory",
+    }
+    return [path for name, path in known.items() if name in normalized]
 
 
 def _infer_simple_type(goal: str) -> TaskType:
