@@ -5,6 +5,37 @@ import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+import yaml
+
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+SKILL_RESOURCE_DIRECTORIES = (
+    "references",
+    "scripts",
+    "assets",
+    "templates",
+    "examples",
+)
+SUPPORTED_FRONTMATTER_KEYS = {
+    "name",
+    "description",
+    "version",
+    "author",
+    "tags",
+    "requires",
+}
+
+
+@dataclass(slots=True)
+class SkillValidation:
+    path: Path
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def valid(self) -> bool:
+        return not self.errors
 
 
 @dataclass(slots=True)
@@ -28,7 +59,7 @@ class Skill:
         """Return lazily readable files shipped beside SKILL.md."""
         root = self.path.parent.resolve()
         names: list[str] = []
-        for directory in ("references", "templates", "examples"):
+        for directory in SKILL_RESOURCE_DIRECTORIES:
             candidate = root / directory
             if not candidate.is_dir():
                 continue
@@ -45,6 +76,7 @@ class SkillContextBuffer:
     def __init__(self, limit: int = 3):
         self.limit = limit
         self._items: OrderedDict[str, str] = OrderedDict()
+        self._active: OrderedDict[str, None] = OrderedDict()
 
     def push(self, name: str | None, body: str | None) -> None:
         if not name or not body:
@@ -52,8 +84,12 @@ class SkillContextBuffer:
         if name in self._items:
             del self._items[name]
         self._items[name] = body
+        if name in self._active:
+            del self._active[name]
+        self._active[name] = None
         while len(self._items) > self.limit:
-            self._items.popitem(last=False)
+            evicted, _ = self._items.popitem(last=False)
+            self._active.pop(evicted, None)
 
     def start_task(self) -> None:
         """Prevent instructions loaded by an earlier task leaking into a new task."""
@@ -76,12 +112,16 @@ class SkillContextBuffer:
 
     def clear(self) -> None:
         self._items.clear()
+        self._active.clear()
 
     def is_empty(self) -> bool:
         return not self._items
 
     def size(self) -> int:
         return len(self._items)
+
+    def is_active(self, name: str) -> bool:
+        return name in self._active
 
 
 class SkillStateStore:
@@ -179,6 +219,7 @@ class SkillRegistry:
         lines = [
             "Available skills:",
             "Load a skill with load_skill(name) when its description matches the task.",
+            "Use search_skills(query) when the visible list does not contain a match.",
         ]
         for skill in skills:
             description = " ".join(skill.description.split())
@@ -187,6 +228,33 @@ class SkillRegistry:
             lines.append(f"- {skill.name}: {description}")
         text = "\n".join(lines)
         return text[:max_chars]
+
+    def search(self, query: str, limit: int = 10) -> list[Skill]:
+        terms = [term for term in re.split(r"\W+", query.lower()) if term]
+        if not terms:
+            return []
+
+        scored: list[tuple[int, str, Skill]] = []
+        for skill in self.enabled_skills():
+            name = skill.name.lower()
+            description = skill.description.lower()
+            tags = " ".join(skill.tags).lower()
+            score = 0
+            for term in terms:
+                if term == name:
+                    score += 100
+                elif name.startswith(term):
+                    score += 40
+                elif term in name:
+                    score += 25
+                if term in tags:
+                    score += 10
+                if term in description:
+                    score += 5
+            if score:
+                scored.append((score, skill.name, skill))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [item[2] for item in scored[: max(1, min(50, limit))]]
 
     def _load_all(self) -> dict[str, Skill]:
         if self._skills is not None:
@@ -210,19 +278,25 @@ class SkillRegistry:
     def _load_skill_file(self, path: Path, source: str, disabled: set[str]) -> Skill | None:
         try:
             content = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeError):
+            return None
+        validation = validate_skill_file(path, content=content)
+        if not validation.valid:
             return None
         metadata = _parse_frontmatter(content)
-        name = metadata.get("name") or path.parent.name
-        description = metadata.get("description") or ""
-        tags = _parse_tags(metadata.get("tags", ""))
+        name = str(metadata["name"])
+        description = str(metadata["description"])
+        requires = metadata.get("requires")
+        if not isinstance(requires, dict):
+            requires = {}
+        tags = _parse_string_list(metadata.get("tags"))
         return Skill(
             name=name,
             description=description,
-            version=metadata.get("version") or "",
+            version=str(metadata.get("version") or ""),
             tags=tags,
-            requires_tools=_parse_tags(metadata.get("requires.tools", "")),
-            requires_mcp=_parse_tags(metadata.get("requires.mcp", "")),
+            requires_tools=_parse_string_list(requires.get("tools")),
+            requires_mcp=_parse_string_list(requires.get("mcp")),
             source=source,
             path=path,
             content=content,
@@ -230,53 +304,113 @@ class SkillRegistry:
         )
 
 
-def _parse_frontmatter(content: str) -> dict[str, str]:
+def validate_skill_file(path: str | Path, *, content: str | None = None) -> SkillValidation:
+    skill_path = Path(path)
+    if skill_path.is_dir():
+        skill_path = skill_path / "SKILL.md"
+    result = SkillValidation(path=skill_path)
+    if content is None:
+        try:
+            content = skill_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            result.errors.append(f"unable to read SKILL.md: {exc}")
+            return result
+
+    block = _frontmatter_block(content)
+    if block is None:
+        result.errors.append("SKILL.md must start with YAML frontmatter delimited by ---")
+        return result
+    try:
+        metadata = yaml.safe_load(block)
+    except yaml.YAMLError as exc:
+        result.errors.append(f"invalid YAML frontmatter: {exc}")
+        return result
+    if not isinstance(metadata, dict):
+        result.errors.append("frontmatter must be a YAML mapping")
+        return result
+
+    name = metadata.get("name")
+    description = metadata.get("description")
+    if not isinstance(name, str) or not name.strip():
+        result.errors.append("frontmatter field 'name' must be a non-empty string")
+    else:
+        name = name.strip()
+        if len(name) > 64 or not SKILL_NAME_PATTERN.fullmatch(name):
+            result.errors.append("skill name must be <=64 lowercase letters, digits, or hyphens")
+        if skill_path.parent.name != name:
+            result.errors.append(
+                f'skill directory "{skill_path.parent.name}" must match name "{name}"'
+            )
+    if not isinstance(description, str) or not description.strip():
+        result.errors.append("frontmatter field 'description' must be a non-empty string")
+
+    body = _strip_frontmatter(content).strip()
+    if not body:
+        result.errors.append("SKILL.md body must not be empty")
+    if len(body.splitlines()) > 500:
+        result.warnings.append(
+            "SKILL.md body exceeds 500 lines; move detailed material into references/"
+        )
+    unknown = sorted(str(key) for key in metadata if key not in SUPPORTED_FRONTMATTER_KEYS)
+    if unknown:
+        result.warnings.append(f"unknown frontmatter fields: {', '.join(unknown)}")
+
+    requires = metadata.get("requires")
+    if requires is not None and not isinstance(requires, dict):
+        result.errors.append("frontmatter field 'requires' must be a mapping")
+    elif isinstance(requires, dict):
+        for key in ("tools", "mcp"):
+            value = requires.get(key)
+            if value is not None and not _is_string_list(value):
+                result.errors.append(f"requires.{key} must be a string or list of strings")
+    if metadata.get("tags") is not None and not _is_string_list(metadata["tags"]):
+        result.errors.append("frontmatter field 'tags' must be a string or list of strings")
+    return result
+
+
+def _frontmatter_block(content: str) -> str | None:
     if not content.startswith("---"):
+        return None
+    match = re.match(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)", content, re.S)
+    return match.group(1) if match else None
+
+
+def _parse_frontmatter(content: str) -> dict[str, Any]:
+    block = _frontmatter_block(content)
+    if block is None:
         return {}
-    match = re.match(r"^---\s*\n(.*?)\n---\s*", content, re.S)
-    if not match:
+    try:
+        metadata = yaml.safe_load(block)
+    except yaml.YAMLError:
         return {}
-    lines = match.group(1).splitlines()
-    metadata: dict[str, str] = {}
-    section = ""
-    index = 0
-    while index < len(lines):
-        raw_line = lines[index]
-        if ":" not in raw_line:
-            index += 1
-            continue
-        indent = len(raw_line) - len(raw_line.lstrip())
-        key, value = raw_line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if indent and section:
-            key = f"{section}.{key}"
-        elif not indent:
-            section = key if not value else ""
-        if value == "|":
-            section = ""
-            index += 1
-            block: list[str] = []
-            while index < len(lines) and (lines[index].startswith(" ") or not lines[index].strip()):
-                block.append(lines[index].strip())
-                index += 1
-            metadata[key] = " ".join(part for part in block if part)
-            continue
-        metadata[key] = value.strip().strip('"').strip("'")
-        index += 1
-    return metadata
+    return metadata if isinstance(metadata, dict) else {}
 
 
 def _strip_frontmatter(content: str) -> str:
-    if not content.startswith("---"):
+    block = _frontmatter_block(content)
+    if block is None:
         return content
-    return re.sub(r"^---\s*\n.*?\n---\s*", "", content, count=1, flags=re.S)
+    return re.sub(
+        r"^---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|$)",
+        "",
+        content,
+        count=1,
+        flags=re.S,
+    )
 
 
-def _parse_tags(raw: str) -> list[str]:
+def _is_string_list(value: Any) -> bool:
+    return isinstance(value, str) or (
+        isinstance(value, list) and all(isinstance(item, str) for item in value)
+    )
+
+
+def _parse_string_list(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        return [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+    if not isinstance(raw, str):
+        return []
     value = raw.strip()
     if not value:
         return []
-    if value.startswith("[") and value.endswith("]"):
-        value = value[1:-1]
     return [item.strip().strip('"').strip("'") for item in value.split(",") if item.strip()]

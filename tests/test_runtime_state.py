@@ -4,7 +4,7 @@ import asyncio
 
 from paicli.agent.verifier import CompletionVerifier
 from paicli.runtime.budget import BudgetManager
-from paicli.runtime.run_state import RunStateStore
+from paicli.runtime.run_state import RunStateStore, resume_target
 from paicli.types import Message
 
 
@@ -25,6 +25,17 @@ def test_run_state_store_round_trip_and_latest_paused(tmp_path):
     assert restored.turns == 4
 
 
+def test_run_state_can_recover_running_checkpoint_by_id(tmp_path):
+    store = RunStateStore(tmp_path)
+    older = store.create("team", "older")
+    newer = store.create("team", "newer")
+
+    assert store.latest_resumable("team").run_id == newer.run_id
+    assert store.latest_resumable("team", run_id=older.run_id).goal == "older"
+    assert resume_target(f"resume {older.run_id}") == older.run_id
+    assert resume_target("please continue the analysis") is False
+
+
 def test_budget_manager_extends_once_at_orchestrator_boundary():
     requests = []
 
@@ -43,6 +54,15 @@ def test_budget_manager_extends_once_at_orchestrator_boundary():
     assert budget.turn_limit == 5
     assert budget.token_limit == 60
     assert detail["context_preserved"] is True
+
+
+def test_budget_reserves_turns_before_starting_a_reviewed_task():
+    budget = BudgetManager(turn_limit=5, token_limit=0)
+    budget.consume(turns=4)
+
+    assert budget.reached() == []
+    assert budget.reached(minimum_turns=2) == ["max_turns"]
+    assert not budget.can_start(minimum_turns=2)
 
 
 def test_completion_verifier_rejects_only_unrecovered_tool_failure():

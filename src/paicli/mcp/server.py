@@ -11,9 +11,10 @@ from paicli.tools import ToolRegistry, get_builtin_tools
 from paicli.tools.base import ToolContext
 
 
-def _build_registry() -> ToolRegistry:
+def _build_registry(cwd: str) -> ToolRegistry:
+    config = load_config(project_root=cwd)
     registry = ToolRegistry()
-    registry.register_all(get_builtin_tools())
+    registry.register_all(get_builtin_tools(skill_enabled=config.features.skill))
     return registry
 
 
@@ -32,7 +33,7 @@ def _tool_list(registry: ToolRegistry) -> list[dict[str, Any]]:
 
 
 async def _handle_request(request: dict[str, Any], cwd: str) -> dict[str, Any]:
-    registry = _build_registry()
+    registry = _build_registry(cwd)
     request_id = request.get("id")
     method = request.get("method")
     params = request.get("params") or {}

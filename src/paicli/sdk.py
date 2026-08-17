@@ -13,7 +13,7 @@ def create_default_engine(cwd: str | None = None) -> QueryEngine:
     config = load_config(project_root=root)
     client = create_llm_client(config.llm)
     registry = ToolRegistry()
-    registry.register_all(get_builtin_tools())
+    registry.register_all(get_builtin_tools(skill_enabled=config.features.skill))
     return QueryEngine(llm_client=client, tool_registry=registry, config=config, cwd=root)
 
 

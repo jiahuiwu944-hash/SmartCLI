@@ -19,26 +19,39 @@ Return only JSON with this shape:
       "id": "stable_source_id",
       "description": "concrete executable step",
       "type": "FILE_READ|FILE_WRITE|COMMAND|ANALYSIS|VERIFICATION",
-      "dependencies": ["stable_source_id"]
+      "dependencies": ["stable_source_id"],
+      "acceptance_criteria": ["observable completion condition"],
+      "read_paths": ["known or expected workspace path"],
+      "write_paths": ["known or expected workspace path"],
+      "parallel_safe": false,
+      "retry_limit": 1
     }
   ]
 }
-Use independent tasks when they can run in parallel.
+Use at most 24 tasks. Dependencies must reference unique task IDs from this plan.
+Set parallel_safe=true only for read-only tasks whose declared paths do not conflict.
+Every mutating task must declare its expected write_paths and concrete acceptance criteria.
 """
 
 
 class Planner:
     def __init__(self, llm_client: LlmClient):
         self.llm_client = llm_client
+        self.last_tokens = 0
+        self.last_turns = 0
 
     async def create_plan(self, goal: str) -> ExecutionPlan:
+        self.last_tokens = 0
+        self.last_turns = 0
         if _is_simple_goal(goal):
             return _minimal_plan(goal)
-        text = await _collect_text(
+        text, tokens = await _collect_text(
             self.llm_client,
             [Message(role="user", content=f"Please create an execution plan for:\n{goal}")],
             system_prompt=PLANNER_PROMPT,
         )
+        self.last_tokens = tokens
+        self.last_turns = 1
         return self.parse_plan(goal, text)
 
     async def replan(self, failed_plan: ExecutionPlan, failure_reason: str) -> ExecutionPlan:
@@ -56,22 +69,37 @@ class Planner:
         task_nodes = data.get("tasks") or data.get("steps") or []
         if not isinstance(task_nodes, list) or not task_nodes:
             raise ValueError("planner output did not contain a non-empty tasks/steps array")
+        if len(task_nodes) > 24:
+            raise ValueError("planner output exceeds the 24-task limit")
 
         plan = ExecutionPlan(id=f"plan_{int(time.time() * 1000)}", goal=goal)
         plan.summary = str(data.get("summary") or "")
         id_mapping: dict[str, str] = {}
+        source_ids: set[str] = set()
 
         for index, node in enumerate(task_nodes, start=1):
             if not isinstance(node, dict):
-                continue
+                raise ValueError(f"planner task {index} must be an object")
             original_id = str(node.get("id") or f"task_{index}")
+            if original_id in source_ids:
+                raise ValueError(f'duplicate planner task id: "{original_id}"')
+            source_ids.add(original_id)
             new_id = f"task_{index}"
             id_mapping[original_id] = new_id
+            task_type = _parse_task_type(str(node.get("type") or "ANALYSIS"))
             plan.add_task(
                 Task(
                     id=new_id,
                     description=str(node.get("description") or original_id),
-                    type=_parse_task_type(str(node.get("type") or "ANALYSIS")),
+                    type=task_type,
+                    acceptance_criteria=_string_list(node.get("acceptance_criteria")),
+                    read_paths=_string_list(node.get("read_paths")),
+                    write_paths=_string_list(node.get("write_paths")),
+                    parallel_safe=(
+                        node.get("parallel_safe") is True
+                        and task_type not in {TaskType.FILE_WRITE, TaskType.COMMAND}
+                    ),
+                    retry_limit=max(0, min(3, _integer(node.get("retry_limit"), 1))),
                 )
             )
 
@@ -83,15 +111,20 @@ class Planner:
                 continue
             dependencies = node.get("dependencies") or []
             if not isinstance(dependencies, list):
-                continue
+                raise ValueError(f"dependencies for {task.id} must be an array")
             for raw_dep in dependencies:
-                dep_id = id_mapping.get(str(raw_dep), str(raw_dep))
-                if dep_id in plan.tasks:
-                    task.add_dependency(dep_id)
-                    plan.tasks[dep_id].add_dependent(task.id)
+                source_dep = str(raw_dep)
+                if source_dep not in id_mapping:
+                    raise ValueError(
+                        f'{task.id} depends on unknown planner task "{source_dep}"'
+                    )
+                dep_id = id_mapping[source_dep]
+                task.add_dependency(dep_id)
+                plan.tasks[dep_id].add_dependent(task.id)
 
-        if not plan.compute_execution_order():
-            raise ValueError("plan contains a cyclic dependency")
+        errors = plan.validate()
+        if errors:
+            raise ValueError("; ".join(errors))
         return plan
 
 
@@ -100,15 +133,20 @@ async def _collect_text(
     messages: list[Message],
     *,
     system_prompt: str,
-) -> str:
+) -> tuple[str, int]:
     text = ""
+    tokens = 0
     async for event in llm_client.chat(messages, [], system_prompt=system_prompt):
         event_type = event.get("type")
         if event_type == "text_delta":
             text += str(event.get("text") or "")
+        elif event_type == "usage":
+            usage = event.get("usage") or {}
+            tokens += int(usage.get("input_tokens") or 0)
+            tokens += int(usage.get("output_tokens") or 0)
         elif event_type == "error":
             raise event["error"]
-    return text
+    return text, tokens
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -156,3 +194,16 @@ def _infer_simple_type(goal: str) -> TaskType:
     if any(token in goal for token in ["验证", "检查"]):
         return TaskType.VERIFICATION
     return TaskType.COMMAND
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _integer(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default

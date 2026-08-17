@@ -452,7 +452,7 @@ def _skill_command(arg: str, console: Console, cwd: str) -> None:
         if not skill:
             console.print(f'Skill "{rest.strip()}" not found.')
             return
-        console.print(skill.content[:12_000])
+        console.print(skill.content)
         return
     if sub == "on" and rest:
         console.print("enabled" if registry.enable(rest.strip()) else "skill not found")

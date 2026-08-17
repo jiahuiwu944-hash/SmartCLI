@@ -18,13 +18,30 @@ class BudgetManager:
         self.turns += max(0, turns)
         self.tokens += max(0, tokens)
 
-    def reached(self) -> list[str]:
+    def reached(self, *, minimum_turns: int = 0) -> list[str]:
         reasons: list[str] = []
-        if self.turns >= self.turn_limit:
+        if self.turns >= self.turn_limit or (
+            minimum_turns and self.turns + minimum_turns > self.turn_limit
+        ):
             reasons.append("max_turns")
         if self.token_limit and self.tokens >= self.token_limit:
             reasons.append("token_budget")
         return reasons
+
+    @property
+    def remaining_turns(self) -> int:
+        return max(0, self.turn_limit - self.turns)
+
+    @property
+    def remaining_tokens(self) -> int:
+        if not self.token_limit:
+            return 0
+        return max(0, self.token_limit - self.tokens)
+
+    def can_start(self, *, minimum_turns: int = 1) -> bool:
+        return self.remaining_turns >= max(1, minimum_turns) and not (
+            self.token_limit and self.remaining_tokens <= 0
+        )
 
     async def request_extension(
         self,
@@ -32,8 +49,9 @@ class BudgetManager:
         additional_turns: int,
         additional_tokens: int,
         mode: str,
+        minimum_turns: int = 0,
     ) -> tuple[bool, dict[str, Any]]:
-        reasons = self.reached()
+        reasons = self.reached(minimum_turns=minimum_turns)
         request = {
             "reason": "+".join(reasons),
             "mode": mode,

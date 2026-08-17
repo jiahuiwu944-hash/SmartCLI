@@ -20,6 +20,7 @@ from paicli.llm import create_llm_client
 from paicli.mcp import load_mcp_server_specs, serve_http, serve_stdio, write_chrome_devtools_config
 from paicli.runtime import RuntimeApiServer
 from paicli.runtime.api import runtime_api_key
+from paicli.skill import SkillRegistry, validate_skill_file
 
 app = typer.Typer(
     name="smartcli",
@@ -28,7 +29,9 @@ app = typer.Typer(
     no_args_is_help=False,
 )
 mcp_app = typer.Typer(help="MCP server management")
+skill_app = typer.Typer(help="Skill discovery and validation")
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(skill_app, name="skill")
 console = Console()
 
 
@@ -174,6 +177,49 @@ def mcp_list(
     for spec in specs.values():
         target = spec.url or f"{spec.command} {' '.join(spec.args)}".strip()
         typer.echo(f"{spec.name}\t{spec.type}\t{target}")
+
+
+@skill_app.command("list")
+def skill_list(
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+) -> None:
+    root = (cwd or Path.cwd()).resolve()
+    rows = SkillRegistry(root).all_skills()
+    if not rows:
+        typer.echo("No skills found.")
+        return
+    for skill in rows:
+        state = "on" if skill.enabled else "off"
+        typer.echo(f"{skill.name}\t{skill.source}\t{state}\t{skill.description}")
+
+
+@skill_app.command("search")
+def skill_search(
+    query: Annotated[str, typer.Argument(help="Name, description, or tag query")],
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Maximum matches")] = 10,
+) -> None:
+    root = (cwd or Path.cwd()).resolve()
+    matches = SkillRegistry(root).search(query, limit=limit)
+    if not matches:
+        typer.echo("No enabled skills matched.")
+        return
+    for skill in matches:
+        typer.echo(f"{skill.name}\t{skill.source}\t{skill.description}")
+
+
+@skill_app.command("validate")
+def skill_validate(
+    path: Annotated[Path, typer.Argument(help="Skill directory or SKILL.md path")],
+) -> None:
+    result = validate_skill_file(path.resolve())
+    for warning in result.warnings:
+        typer.echo(f"warning: {warning}", err=True)
+    if result.errors:
+        for error in result.errors:
+            typer.echo(f"error: {error}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"valid: {result.path}")
 
 
 async def _run_prompt(prompt: str, cwd: str, config) -> None:

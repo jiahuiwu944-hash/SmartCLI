@@ -1,18 +1,18 @@
 ---
 name: web-access
 description: |
-  Use this skill for live web research, webpage fetching, login-state browsing, dynamic pages, social sites, and tasks that need current internet evidence.
-version: "1.0.0"
-author: SmartCLI
-tags: [web, browser, research]
+  Research current information on the public web or in a browser session. Use for live facts, recent changes, source-backed answers, webpage inspection, dynamic or login-gated pages, and social sites.
 ---
 
 # Web Access
 
-Use network tools deliberately:
+Follow this sequence:
 
-- Start with the exact user goal and identify what must be current.
-- Use `web_search` for discovery and `web_fetch` for public static pages.
-- Prefer Chrome DevTools MCP when a page needs login state, JavaScript rendering, or browser inspection.
-- Keep sources and dates visible in the answer when recency matters.
-- If a fetched page is empty because of SPA or anti-bot behavior, switch to browser/MCP instead of guessing.
+1. Identify which claims require current evidence and what date range matters.
+2. Use `web_search` to discover candidate sources; prefer primary and authoritative sources.
+3. Use `web_fetch` for public static pages. Open the specific source rather than relying only on a search snippet.
+4. Use Chrome DevTools MCP only when the task needs an existing login, JavaScript rendering, browser interaction, or visible page inspection.
+5. Cross-check consequential claims when one source may be stale, ambiguous, or promotional.
+6. Report source URLs and relevant dates near the claims they support. Distinguish sourced facts from inference.
+
+If a static fetch is empty or blocked, switch to the browser path when available. If no usable path is available, state the limitation and do not guess.

@@ -23,8 +23,8 @@ SmartCLI 是一个为了深入学习和探索 AI Agent 核心机制而开发的�
 - OpenAI-compatible 流式 LLM 客户端，默认面向 DeepSeek 配置
 - 支持 `DEEPSEEK_API_KEY` 等 provider-specific API Key
 - ReAct 动态执行循环：任务完成时自然结束，并通过轮次、Token、运行时间、重复调用和连续错误预算防止失控
-- Plan-and-Execute 模式，使用独立 Planner 生成 DAG，按依赖并行执行，并在任务级与计划级校验完成证据
-- Multi-Agent 协作模式，包含 Planner、Worker、Reviewer、依赖调度、并行 worker 和 review 重试
+- Plan-and-Execute 与 Multi-Agent 共用一套 DAG 编排内核；只有显式声明且资源不冲突的只读任务才会并行，写操作与命令默认串行
+- Multi-Agent 是更严格的 Team 策略层：复用统一 Task/状态/预算/checkpoint 模型，并增加逐任务证据审查与反馈重试
 - 内置文件、Shell、grep、glob、记忆、网页搜索、网页抓取、代码搜索等工具
 - HITL 人工确认、命令/路径安全策略和 JSONL 审计日志
 - MCP client，支持 stdio 和 Streamable HTTP MCP server
@@ -33,7 +33,7 @@ SmartCLI 是一个为了深入学习和探索 AI Agent 核心机制而开发的�
 - SmartCLI 自身也可以作为 MCP server 暴露内置工具
 - Runtime API，支持线程、turn、事件日志和持久化后台任务
 - Agentic Code Navigation：Repo Map、统一代码搜索、符号索引、引用查找、上下文去重与增量刷新
-- Plan/Team 运行状态原子持久化，预算耗尽后可从 `.paicli/runs` 断点续跑
+- Plan/Team 在任务启动、重试和完成时原子保存状态；预算耗尽或进程中断后可按 run ID 从 `.paicli/runs` 断点续跑
 - Agent run 前后自动创建快照，支持恢复现场
 - 支持本地图片和远程图片输入，并根据模型能力自动降级
 
@@ -117,7 +117,7 @@ PAICLI_API_KEY=your_key_here
 
 模型准备结束任务时，SmartCLI 会调用 Stop Hook 审查答案是否完成目标、是否具备工具或测试证据，并在 LLM 审查前确定性拦截“工具被跳过却声称全部完成”等矛盾；审查不通过时，反馈会写回当前上下文并驱动 Agent 继续修正。检测到连续相同的工具和参数时不会立即终止，而是跳过重复执行并要求模型更换参数、工具或方案。
 
-达到轮次或总 Token 上限后，交互终端会询问是否追加预算。ReAct 保留完整消息与工具上下文；Plan/Team 由 Orchestrator 统一询问一次，并把 DAG、步骤状态、重试次数、结果和预算原子保存到 `.paicli/runs`，之后可用 `/plan 继续` 或 `/team 继续` 恢复未完成任务。
+达到轮次或总 Token 上限后，交互终端会询问是否追加预算。ReAct 保留完整消息与工具上下文；Plan/Team 共用全局轮次、Token 和运行时间预算，并把 DAG、任务状态、尝试次数、真实工具证据与预算原子保存到 `.paicli/runs`。可用 `/plan resume [run_id]` 或 `/team resume [run_id]` 恢复最近一次或指定的 `PAUSED`/异常中断 `RUNNING` checkpoint；中文 `继续` 仍然可用。
 
 ### 智能代码导航
 
@@ -195,7 +195,9 @@ uv run smartcli -p "解释这个仓库"
 /index [path]              # incrementally refresh SHA-256/symbol index
 /search [--mode auto|symbol|text|references] <query>  # default mode: auto
 /plan <task>
+/plan resume [run_id]
 /team <task>
+/team resume [run_id]
 /model
 /skill
 /skill list
@@ -227,22 +229,36 @@ SmartCLI 内置了一组 Agent 可以调用的本地工具和联网工具：
 - `web_fetch`
 - `save_memory`
 - `load_skill`
+- `search_skills`
 - `read_skill_resource`
+- `copy_skill_resource`
 - `search_code`
 - `repo_map`
 - `document_symbols`
 - `revert_turn`
 
 Skill 采用按需加载：启动时只向模型提供名称和描述，模型调用 `load_skill` 后，
-`SKILL.md` 正文会在当前任务的下一轮 ReAct 前生效，并在新任务开始时清理。
-Skill 可以在 `references/`、`templates/` 和 `examples/` 中附带资源，模型仅在需要时
-通过 `read_skill_resource` 读取。可在 frontmatter 中声明运行依赖：
+完整的 `SKILL.md` 正文会在当前任务的下一轮 ReAct 前生效，并在新任务开始时清理。
+同一轮中的其他工具调用会延后，确保 Skill 指令先于实际操作生效。Skill 可以在
+`references/`、`scripts/`、`assets/`、`templates/` 和 `examples/` 中附带资源；模型必须
+先激活 Skill，再通过 `read_skill_resource` 按需读取文本资源，长资源可使用 `offset`
+续读；二进制资产或需要落到工作区的脚本可通过 `copy_skill_resource` 复制到一个尚不存在的
+目标路径。Skill 较多时可使用 `search_skills` 检索。可在 frontmatter 中声明运行依赖：
 
 ```yaml
 requires:
   tools: [web_search, web_fetch]
   mcp: [chrome-devtools]
 ```
+
+校验 Skill 目录：
+
+```bash
+uv run smartcli skill validate path/to/skill
+```
+
+Skill 名称必须与目录名一致，只能使用小写字母、数字和连字符，且必须提供非空的
+`name`、`description` 和正文。设置 `PAICLI_SKILL=false` 会从工具表中移除 Skill 工具。
 
 写文件、执行命令、远程 MCP 写操作、恢复快照等危险动作，会经过 policy、HITL 和 audit 处理。
 

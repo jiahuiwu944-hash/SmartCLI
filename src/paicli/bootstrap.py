@@ -11,7 +11,7 @@ async def build_tool_registry(
     cwd: str,
 ) -> tuple[ToolRegistry, McpClientManager | None]:
     registry = ToolRegistry()
-    registry.register_all(get_builtin_tools())
+    registry.register_all(get_builtin_tools(skill_enabled=config.features.skill))
     manager: McpClientManager | None = None
     if config.features.mcp:
         manager = McpClientManager(cwd)

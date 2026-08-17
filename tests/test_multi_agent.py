@@ -24,6 +24,9 @@ def test_orchestrator_parses_steps_and_review_output(tmp_path, monkeypatch):
     assert [step.id for step in steps] == ["step_1", "step_2"]
     assert steps[1].dependencies == ["step_1"]
     assert orchestrator.parse_review_approval('{"approved": true, "issues": []}')
+    assert not orchestrator.parse_review_approval(
+        '{"approved": "false", "issues": []}'
+    )
     assert not orchestrator.parse_review_approval("执行结果未通过审查")
     assert "缺少验证" in orchestrator.parse_review_issues(
         '{"approved": false, "issues": ["缺少验证"]}'
@@ -50,6 +53,27 @@ def test_orchestrator_runs_independent_workers_in_parallel(tmp_path, monkeypatch
     assert "Task A result" in result
     assert "Task B result" in result
     assert client.peak_concurrency == 2
+
+
+def test_team_retries_after_evidence_review_rejection(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    client = RetryTeamClient()
+    orchestrator = _orchestrator(tmp_path, client)
+
+    async def run():
+        events = []
+        async for event in orchestrator.run("先实现功能，然后验证结果"):
+            if event.get("type") == "error":
+                raise event["error"]
+            events.append(event)
+        return events
+
+    events = asyncio.run(run())
+
+    assert client.worker_attempts == 2
+    assert any(event.get("type") == "task_retry_started" for event in events)
+    assert events[-1]["type"] == "done"
+    assert events[-1]["completed"] is True
 
 
 class FakeTeamClient:
@@ -81,13 +105,15 @@ class ParallelTeamClient(FakeTeamClient):
             yield {"type": "text_delta", "text": '{"approved": true, "issues": []}'}
             yield {"type": "message_end", "stop_reason": "end_turn"}
             return
-        if "Create an execution plan" in body:
+        if "create an execution plan" in body.lower():
             yield {
                 "type": "text_delta",
                 "text": (
                     '{"summary":"parallel","steps":['
-                    '{"id":"a","description":"Task A","type":"ANALYSIS","dependencies":[]},'
-                    '{"id":"b","description":"Task B","type":"ANALYSIS","dependencies":[]}'
+                    '{"id":"a","description":"Task A","type":"ANALYSIS",'
+                    '"dependencies":[],"parallel_safe":true,"read_paths":["a"]},'
+                    '{"id":"b","description":"Task B","type":"ANALYSIS",'
+                    '"dependencies":[],"parallel_safe":true,"read_paths":["b"]}'
                     "]}"
                 ),
             }
@@ -105,6 +131,47 @@ class ParallelTeamClient(FakeTeamClient):
             yield {"type": "message_end", "stop_reason": "end_turn"}
             return
         yield {"type": "text_delta", "text": "fallback"}
+        yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+class RetryTeamClient(FakeTeamClient):
+    def __init__(self):
+        self.worker_attempts = 0
+        self.review_attempts = 0
+
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        body = _message_text(messages[-1].content)
+        if "Stop Hook reviewer" in system_prompt:
+            yield {
+                "type": "text_delta",
+                "text": '{"approved": true, "feedback": "", "memories": []}',
+            }
+        elif "create an execution plan" in body.lower():
+            yield {
+                "type": "text_delta",
+                "text": (
+                    '{"tasks":[{"id":"a","description":"Implement feature",'
+                    '"type":"ANALYSIS","dependencies":[],"retry_limit":2}]}'
+                ),
+            }
+        elif "Original task" in body:
+            self.review_attempts += 1
+            approved = self.review_attempts > 1
+            issues = [] if approved else ["missing verification"]
+            yield {
+                "type": "text_delta",
+                "text": __import__("json").dumps(
+                    {"approved": approved, "issues": issues}
+                ),
+            }
+        elif "Current task" in body:
+            self.worker_attempts += 1
+            yield {
+                "type": "text_delta",
+                "text": "verified result" if self.worker_attempts > 1 else "draft result",
+            }
+        else:
+            yield {"type": "text_delta", "text": "concise synthesis"}
         yield {"type": "message_end", "stop_reason": "end_turn"}
 
 

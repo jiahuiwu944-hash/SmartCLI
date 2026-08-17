@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from paicli.agent import PlanExecuteAgent
+from paicli.agent.plan_execute import _parse_review, _select_safe_batch
 from paicli.config import load_config
-from paicli.plan import ExecutionPlan, Planner, Task, TaskType
+from paicli.plan import ExecutionPlan, Planner, Task, TaskStatus, TaskType
 from paicli.tools import ToolRegistry, get_builtin_tools
 
 
@@ -49,6 +52,74 @@ def test_planner_parses_tasks_and_dependencies():
     assert plan.get_task("task_2").type == TaskType.VERIFICATION
 
 
+@pytest.mark.parametrize(
+    "tasks",
+    [
+        [
+            {"id": "a", "description": "A", "dependencies": []},
+            {"id": "a", "description": "B", "dependencies": []},
+        ],
+        [{"id": "a", "description": "A", "dependencies": ["missing"]}],
+        [
+            {"id": "a", "description": "A", "dependencies": ["b"]},
+            {"id": "b", "description": "B", "dependencies": ["a"]},
+        ],
+    ],
+)
+def test_planner_rejects_invalid_graphs(tasks):
+    planner = Planner(FakeClient())
+
+    with pytest.raises(ValueError):
+        planner.parse_plan("demo", __import__("json").dumps({"tasks": tasks}))
+
+
+def test_resource_scheduler_only_batches_declared_non_conflicting_reads():
+    read_a = Task(
+        "a",
+        "read a",
+        TaskType.FILE_READ,
+        parallel_safe=True,
+        read_paths=["src/a.py"],
+    )
+    read_b = Task(
+        "b",
+        "read b",
+        TaskType.FILE_READ,
+        parallel_safe=True,
+        read_paths=["src/b.py"],
+    )
+    write = Task(
+        "write",
+        "write a",
+        TaskType.FILE_WRITE,
+        parallel_safe=True,
+        write_paths=["src/a.py"],
+    )
+
+    assert _select_safe_batch([read_a, read_b], 4) == [read_a, read_b]
+    assert _select_safe_batch([write, read_b], 4) == [write]
+
+
+def test_failed_dependencies_are_propagated_as_blocked():
+    plan = ExecutionPlan(id="plan", goal="demo")
+    failed = Task("a", "A")
+    dependent = Task("b", "B", dependencies=["a"])
+    plan.add_task(failed)
+    plan.add_task(dependent)
+    failed.mark_failed("boom")
+
+    blocked = plan.propagate_blocked()
+
+    assert blocked == [dependent]
+    assert dependent.status == TaskStatus.BLOCKED
+    assert "a" in dependent.error
+
+
+def test_review_parser_requires_a_real_json_boolean():
+    assert _parse_review('{"approved": true, "issues": []}')[0]
+    assert not _parse_review('{"approved": "false", "issues": []}')[0]
+
+
 def test_plan_execute_runs_independent_tasks_in_parallel(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     client = ParallelPlanClient()
@@ -65,18 +136,29 @@ def test_plan_execute_runs_independent_tasks_in_parallel(tmp_path, monkeypatch):
 
     async def run():
         text = ""
+        events = []
         async for event in agent.run("先做 A 和 B，然后汇总"):
+            events.append(event)
             if event.get("type") == "text_delta":
                 text += str(event.get("text") or "")
             elif event.get("type") == "error":
                 raise event["error"]
-        return text
+        return text, events
 
-    result = asyncio.run(run())
+    result, events = asyncio.run(run())
 
     assert "Completed [task_1]" in result
     assert "Completed [task_2]" in result
     assert client.peak_concurrency == 2
+    assert any(event.get("type") == "task_started" for event in events)
+    assert any(event.get("type") == "task_text_delta" for event in events)
+    first_delta = next(
+        i for i, event in enumerate(events) if event.get("type") == "task_text_delta"
+    )
+    first_done = next(
+        i for i, event in enumerate(events) if event.get("type") == "plan_task_done"
+    )
+    assert first_delta < first_done
 
 
 class FakeClient:
@@ -102,10 +184,20 @@ class ParallelPlanClient(FakeClient):
                 "type": "text_delta",
                 "text": (
                     '{"summary":"parallel","tasks":['
-                    '{"id":"a","description":"Task A","type":"ANALYSIS","dependencies":[]},'
-                    '{"id":"b","description":"Task B","type":"ANALYSIS","dependencies":[]}'
+                    '{"id":"a","description":"Task A","type":"ANALYSIS",'
+                    '"dependencies":[],"parallel_safe":true,"read_paths":["a"]},'
+                    '{"id":"b","description":"Task B","type":"ANALYSIS",'
+                    '"dependencies":[],"parallel_safe":true,"read_paths":["b"]}'
                     "]}"
                 ),
+            }
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+            return
+
+        if "Stop Hook reviewer" in system_prompt:
+            yield {
+                "type": "text_delta",
+                "text": '{"approved": true, "feedback": "", "memories": []}',
             }
             yield {"type": "message_end", "stop_reason": "end_turn"}
             return

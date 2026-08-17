@@ -19,6 +19,7 @@ class RunState:
     tokens: int = 0
     payload: dict[str, Any] = field(default_factory=dict)
     updated_at: float = field(default_factory=time.time)
+    schema_version: int = 2
 
 
 class RunStateStore:
@@ -47,10 +48,24 @@ class RunStateStore:
             temporary.unlink(missing_ok=True)
 
     def latest_paused(self, mode: str) -> RunState | None:
+        return self.latest_resumable(mode, statuses={"PAUSED"})
+
+    def latest_resumable(
+        self,
+        mode: str,
+        *,
+        run_id: str | None = None,
+        statuses: set[str] | None = None,
+    ) -> RunState | None:
+        allowed = statuses or {"PAUSED", "RUNNING"}
         candidates: list[RunState] = []
         for path in self.directory.glob(f"{mode}-*.json"):
             state = self.load(path)
-            if state and state.status == "PAUSED":
+            if (
+                state
+                and state.status in allowed
+                and (run_id is None or state.run_id == run_id)
+            ):
                 candidates.append(state)
         return max(candidates, key=lambda item: item.updated_at, default=None)
 
@@ -69,4 +84,18 @@ class RunStateStore:
 
 
 def is_resume_request(message: str) -> bool:
-    return message.strip().lower() in {"continue", "resume", "继续", "继续执行", "/resume"}
+    return resume_target(message) is not False
+
+
+def resume_target(message: str) -> str | None | bool:
+    """Return an optional run id, or False when *message* is not a resume command."""
+    parts = message.strip().split(maxsplit=1)
+    if not parts or parts[0].lower() not in {
+        "continue",
+        "resume",
+        "继续",
+        "继续执行",
+        "/resume",
+    }:
+        return False
+    return parts[1].strip() if len(parts) == 2 and parts[1].strip() else None

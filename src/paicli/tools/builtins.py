@@ -26,7 +26,7 @@ from paicli.tools.file_version import (
 from paicli.web import fetch_url, search_web
 
 
-def get_builtin_tools() -> list[Tool]:
+def get_builtin_tools(*, skill_enabled: bool = True) -> list[Tool]:
     tools = [
         Tool(
             name="read_file",
@@ -248,10 +248,26 @@ def get_builtin_tools() -> list[Tool]:
             handler=load_skill,
         ),
         Tool(
+            name="search_skills",
+            description=(
+                "Search enabled SmartCLI skills by name, description, and tags. Use this when "
+                "the skill index does not show a relevant match."
+            ),
+            parameters=object_schema(
+                {
+                    "query": {"type": "string", "description": "Skill search query"},
+                    "limit": {"type": "number", "description": "Maximum matches"},
+                },
+                ["query"],
+            ),
+            required_keys=["query"],
+            handler=search_skills,
+        ),
+        Tool(
             name="read_skill_resource",
             description=(
-                "Read one reference, template, or example advertised by an activated skill. "
-                "Use this only when the core SKILL.md instructions require that resource."
+                "Read a text resource advertised by an activated skill. Use offset to continue "
+                "when a long resource is returned in multiple chunks."
             ),
             parameters=object_schema(
                 {
@@ -264,11 +280,41 @@ def get_builtin_tools() -> list[Tool]:
                         "type": "number",
                         "description": "Maximum characters to return; defaults to 8000",
                     },
+                    "offset": {
+                        "type": "number",
+                        "description": "Zero-based character offset; defaults to 0",
+                    },
                 },
                 ["name", "path"],
             ),
             required_keys=["name", "path"],
             handler=read_skill_resource,
+        ),
+        Tool(
+            name="copy_skill_resource",
+            description=(
+                "Copy an activated skill resource, including a binary asset or script, into a "
+                "new file in the current workspace. The destination must not already exist."
+            ),
+            parameters=object_schema(
+                {
+                    "name": {"type": "string", "description": "Skill name"},
+                    "path": {
+                        "type": "string",
+                        "description": "Relative resource path shown by load_skill",
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "New workspace-relative destination path",
+                    },
+                },
+                ["name", "path", "destination"],
+            ),
+            required_keys=["name", "path", "destination"],
+            handler=copy_skill_resource,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
         ),
         Tool(
             name="search_code",
@@ -345,6 +391,14 @@ def get_builtin_tools() -> list[Tool]:
             requires_approval=True,
         ),
     ]
+    if not skill_enabled:
+        skill_tools = {
+            "load_skill",
+            "search_skills",
+            "read_skill_resource",
+            "copy_skill_resource",
+        }
+        return [tool for tool in tools if tool.name not in skill_tools]
     return tools
 
 
@@ -724,6 +778,8 @@ async def search_memory(payload: dict[str, Any], context: ToolContext) -> ToolRe
 
 
 async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    if not context.config.features.skill:
+        return ToolResult("Skills are disabled by configuration.", is_error=True)
     skill = SkillRegistry(context.cwd).load(str(payload["name"]))
     if not skill:
         return ToolResult(f'Skill "{payload["name"]}" not found or disabled.', is_error=True)
@@ -735,8 +791,6 @@ async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResul
             is_error=True,
         )
     content = skill.body or skill.content
-    if len(content) > 5_000:
-        content = content[:5_000] + "\n... [truncated; use /skill show for the full skill]"
     resources = skill.resource_names()
     if resources:
         content += (
@@ -752,35 +806,115 @@ async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResul
     return ToolResult(content, display_summary=f"Loaded skill {skill.name}")
 
 
+async def search_skills(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    if not context.config.features.skill:
+        return ToolResult("Skills are disabled by configuration.", is_error=True)
+    query = str(payload["query"]).strip()
+    limit = max(1, min(50, int(payload.get("limit") or 10)))
+    matches = SkillRegistry(context.cwd).search(query, limit=limit)
+    if not matches:
+        return ToolResult(f'No enabled skills matched "{query}".')
+    lines = [
+        f"- {skill.name} [{skill.source}]: {' '.join(skill.description.split())}"
+        for skill in matches
+    ]
+    return ToolResult("\n".join(lines), display_summary=f"Found {len(matches)} skills")
+
+
 async def read_skill_resource(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    if not context.config.features.skill:
+        return ToolResult("Skills are disabled by configuration.", is_error=True)
     skill = SkillRegistry(context.cwd).load(str(payload["name"]))
     if not skill:
         return ToolResult(f'Skill "{payload["name"]}" not found or disabled.', is_error=True)
+    buffer = context.skill_context_buffer
+    if buffer is None or not buffer.is_active(skill.name):
+        return ToolResult(
+            f'Activate skill "{skill.name}" with load_skill before reading its resources.',
+            is_error=True,
+        )
     relative = str(payload["path"]).replace("\\", "/").strip()
     if not relative or Path(relative).is_absolute():
         return ToolResult("Skill resource path must be relative.", is_error=True)
-    allowed = set(skill.resource_names())
-    if relative not in allowed:
+    path = _skill_resource_path(skill, relative)
+    if path is None:
         return ToolResult(
             f'Resource "{relative}" is not advertised by skill "{skill.name}".',
             is_error=True,
         )
-    root = skill.path.parent.resolve()
-    path = (root / relative).resolve()
-    if not path.is_relative_to(root) or not path.is_file() or path.is_symlink():
-        return ToolResult("Skill resource path is invalid.", is_error=True)
     limit = max(500, min(20_000, int(payload.get("max_chars") or 8_000)))
+    offset = max(0, int(payload.get("offset") or 0))
     try:
         content = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         return ToolResult(f"Unable to read skill resource: {exc}", is_error=True)
-    truncated = len(content) > limit
+    if offset > len(content):
+        return ToolResult(
+            f"Skill resource offset {offset} exceeds content length {len(content)}.",
+            is_error=True,
+        )
+    chunk = content[offset : offset + limit]
+    next_offset = offset + len(chunk)
+    truncated = next_offset < len(content)
     if truncated:
-        content = content[:limit] + "\n... [skill resource truncated]"
+        chunk += (
+            "\n... [skill resource truncated; continue with "
+            f"offset={next_offset}; total_chars={len(content)}]"
+        )
     return ToolResult(
-        content,
+        chunk,
         display_summary=f"Read {skill.name}/{relative}" + (" (truncated)" if truncated else ""),
     )
+
+
+async def copy_skill_resource(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    if not context.config.features.skill:
+        return ToolResult("Skills are disabled by configuration.", is_error=True)
+    skill = SkillRegistry(context.cwd).load(str(payload["name"]))
+    if not skill:
+        return ToolResult(f'Skill "{payload["name"]}" not found or disabled.', is_error=True)
+    buffer = context.skill_context_buffer
+    if buffer is None or not buffer.is_active(skill.name):
+        return ToolResult(
+            f'Activate skill "{skill.name}" with load_skill before copying its resources.',
+            is_error=True,
+        )
+    relative = str(payload["path"]).replace("\\", "/").strip()
+    source = _skill_resource_path(skill, relative)
+    if source is None:
+        return ToolResult(
+            f'Resource "{relative}" is not advertised by skill "{skill.name}".',
+            is_error=True,
+        )
+    destination = _resolve_path(context, str(payload["destination"]))
+    if destination.exists():
+        return ToolResult(
+            f'Destination "{payload["destination"]}" already exists; choose a new path.',
+            is_error=True,
+        )
+    content = source.read_bytes()
+    try:
+        atomic_write(destination, content, observed_version=MISSING_VERSION)
+    except FileChangedDuringWriteError:
+        return ToolResult(
+            f'Destination "{payload["destination"]}" was created concurrently; choose a new path.',
+            is_error=True,
+        )
+    relative_destination = destination.relative_to(context.cwd)
+    return ToolResult(
+        f"Copied {skill.name}/{relative} to {relative_destination} ({len(content)} bytes).",
+        display_summary=f"Copied {relative_destination}",
+    )
+
+
+def _skill_resource_path(skill, relative: str) -> Path | None:
+    if relative not in set(skill.resource_names()):
+        return None
+    root = skill.path.parent.resolve()
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root) or not path.is_file() or path.is_symlink():
+        return None
+    return path
 
 
 def _missing_skill_dependencies(skill, context: ToolContext) -> list[str]:

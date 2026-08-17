@@ -20,6 +20,7 @@ class TaskStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+    BLOCKED = "BLOCKED"
 
 
 class PlanStatus(StrEnum):
@@ -42,6 +43,13 @@ class Task:
     error: str = ""
     start_time: float = 0.0
     end_time: float = 0.0
+    acceptance_criteria: list[str] = field(default_factory=list)
+    read_paths: list[str] = field(default_factory=list)
+    write_paths: list[str] = field(default_factory=list)
+    parallel_safe: bool = False
+    retry_limit: int = 1
+    attempt_count: int = 0
+    evidence: list[str] = field(default_factory=list)
 
     def add_dependency(self, task_id: str) -> None:
         if task_id not in self.dependencies:
@@ -53,6 +61,7 @@ class Task:
 
     def mark_started(self) -> None:
         self.status = TaskStatus.RUNNING
+        self.attempt_count += 1
         self.start_time = time.time()
 
     def mark_completed(self, result: str) -> None:
@@ -67,6 +76,11 @@ class Task:
 
     def mark_skipped(self) -> None:
         self.status = TaskStatus.SKIPPED
+        self.end_time = time.time()
+
+    def mark_blocked(self, reason: str) -> None:
+        self.status = TaskStatus.BLOCKED
+        self.error = reason
         self.end_time = time.time()
 
     def is_executable(self, all_tasks: dict[str, Task]) -> bool:
@@ -90,6 +104,8 @@ class ExecutionPlan:
     _execution_order: list[str] = field(default_factory=list)
 
     def add_task(self, task: Task) -> None:
+        if task.id in self.tasks:
+            raise ValueError(f'duplicate task id: "{task.id}"')
         self.tasks[task.id] = task
         for dep_id in task.dependencies:
             dep = self.tasks.get(dep_id)
@@ -125,7 +141,9 @@ class ExecutionPlan:
             visiting.add(task.id)
             for dep_id in task.dependencies:
                 dep = self.tasks.get(dep_id)
-                if dep and not visit(dep):
+                if dep is None:
+                    return False
+                if not visit(dep):
                     return False
             visiting.remove(task.id)
             visited.add(task.id)
@@ -165,14 +183,57 @@ class ExecutionPlan:
     def progress(self) -> float:
         if not self.tasks:
             return 1.0
-        completed = sum(1 for task in self.tasks.values() if task.status == TaskStatus.COMPLETED)
-        return completed / len(self.tasks)
+        terminal = {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.SKIPPED,
+            TaskStatus.BLOCKED,
+        }
+        finished = sum(1 for task in self.tasks.values() if task.status in terminal)
+        return finished / len(self.tasks)
 
     def is_all_completed(self) -> bool:
         return all(task.status == TaskStatus.COMPLETED for task in self.tasks.values())
 
     def has_failed(self) -> bool:
-        return any(task.status == TaskStatus.FAILED for task in self.tasks.values())
+        return any(
+            task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}
+            for task in self.tasks.values()
+        )
+
+    def validate(self) -> list[str]:
+        errors: list[str] = []
+        for task in self.tasks.values():
+            for dep_id in task.dependencies:
+                if dep_id not in self.tasks:
+                    errors.append(f'{task.id} depends on unknown task "{dep_id}"')
+                elif dep_id == task.id:
+                    errors.append(f"{task.id} depends on itself")
+        if not errors and not self.compute_execution_order():
+            errors.append("plan contains a cyclic dependency")
+        return errors
+
+    def propagate_blocked(self) -> list[Task]:
+        blocked: list[Task] = []
+        changed = True
+        while changed:
+            changed = False
+            for task in self.tasks.values():
+                if task.status != TaskStatus.PENDING:
+                    continue
+                failed_dependencies = [
+                    dep_id
+                    for dep_id in task.dependencies
+                    if self.tasks[dep_id].status
+                    in {TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.SKIPPED}
+                ]
+                if failed_dependencies:
+                    task.mark_blocked(
+                        "blocked by failed dependencies: " + ", ".join(failed_dependencies)
+                    )
+                    blocked.append(task)
+                    changed = True
+        return blocked
 
     def mark_started(self) -> None:
         self.status = PlanStatus.RUNNING
