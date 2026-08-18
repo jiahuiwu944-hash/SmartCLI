@@ -1,57 +1,23 @@
-<div align="center">
-  <h1>π SmartCLI</h1>
-  <p><strong>面向真实软件研发场景的终端 AI 编程智能体</strong></p>
-  <p>用 Python 从零实现 Agent Runtime：让模型能够理解项目、规划任务、调用工具、安全修改代码，并对最终结果进行验证。</p>
+# SmartCLI
 
-  <p>
-    <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
-    <img src="https://img.shields.io/badge/Agent-ReAct%20%7C%20Plan%20%7C%20Team-7C3AED" alt="Agent Runtime">
-    <img src="https://img.shields.io/badge/MCP-Client%20%26%20Server-00A67E" alt="MCP">
-    <img src="https://img.shields.io/badge/Tests-Passing-2EA44F" alt="Tests Passing">
-    <img src="https://img.shields.io/badge/License-MIT-2563EB" alt="MIT License">
-  </p>
-</div>
+> 基于 ReAct、MCP 与多 Agent 协作的终端 AI 编程助手。
 
-> SmartCLI 不是简单地把大模型包装进命令行，而是从 **模型接入、ReAct 决策、工具执行、任务编排、代码导航、长短期记忆、安全控制到结果验收**，完整实现了一套可运行、可验证、可扩展的 AI Agent 工程体系。
+SmartCLI 是我为了深入学习和探索 AI Agent 而开发的个人项目。它面向真实的软件研发场景，让大模型能够通过自然语言完成代码定位、文件修改、命令执行和联网查询，并在执行过程中处理任务规划、上下文管理、安全审批与结果验证。
 
-## 项目概览
+项目没有依赖现成的 Agent 框架，而是使用 Python 从模型调用开始实现完整链路，重点研究一个 Agent 如何从“能够调用工具”逐步演进到“能够可靠地完成任务”。
 
-SmartCLI 面向代码检索、文件修改、命令执行、联网查询与复杂任务协作场景。模型负责分析与决策，Tool Executor 负责执行真实操作，Memory 与 Code Navigation 提供上下文，Policy/HITL 建立安全边界，Stop Hook 则在任务结束前检查执行证据，形成从自然语言目标到可验证结果的闭环。
+## 核心设计
+
+- **ReAct 自主执行：** 通过 OpenAI-Compatible API 与 SSE 流式协议接入多种模型，循环执行“模型决策 → Tool Call → Tool Result → 继续推理”。系统同时设置轮次、Token、运行时间和连续错误预算，避免任务失控。
+- **结果校验与自动纠偏：** 模型准备结束时由 Stop Hook 检查需求覆盖度和工具证据，校验失败后将反馈写回上下文继续执行；连续相同的工具调用会被指纹检测拦截，引导模型调整参数或更换方案。
+- **任务规划与协作：** Plan 和 Team 模式共用 DAG 编排内核，根据依赖关系调度任务；只读且资源不冲突的任务可以并行，写操作默认串行，并支持任务审查、反馈重试和 checkpoint 续跑。
+- **智能代码导航：** 通过 Repo Map 建立项目视野，再结合 SQLite 符号索引和 ripgrep 定位定义、文本与引用；最终以 `read_file` 读取的实时源码为准，写入后由 Post Hook 按文件 Hash 增量刷新索引。
+- **可扩展的 Agent Runtime：** Tool Executor 使用 Pre/Post/Error Hook 解耦审批、审计与异常处理；MCP 动态接入外部 Tool、Resource 和 Prompt；Skill 则通过懒加载和资源按需读取扩展专项工作流。
+- **上下文与安全执行：** 短期记忆根据 Token 压力压缩历史工具结果与旧对话，长期记忆按项目召回已验证事实；文件写入使用 SHA-256 版本校验和原子替换，并结合 PathGuard、HITL、审计日志与 Snapshot 控制风险。
 
 ```text
-SmartCLI = LLM 决策 + Tool 执行 + Memory 上下文 + Policy 边界 + Verifier 验收
+用户任务 → 模型决策 → 工具执行 → 结果观察 → 继续推理 → Stop Hook 验收 → 最终答案
 ```
-
-## Agent 执行闭环
-
-```mermaid
-flowchart LR
-    U["用户任务"] --> C["上下文组装"]
-    C --> L["LLM 推理与决策"]
-    L -->|Tool Call| E["Tool Executor"]
-    E --> H["Pre / Post / Error Hook"]
-    H --> R["Tool Result"]
-    R --> L
-    L -->|准备结束| S["Stop Hook"]
-    S -->|校验失败，写回反馈| L
-    S -->|approved| A["最终答案"]
-```
-
-当模型停止调用工具并准备回答时，系统不会立即相信它已经完成任务，而是结合原始需求、最终答案与 Tool Call/Result 证据进行验收；如果文件没有真正修改、命令失败或测试没有通过，反馈会重新进入 ReAct 上下文，驱动 Agent 继续修正。
-
-## 核心工程设计
-
-| 工程问题 | SmartCLI 的解决方案 | 价值 |
-| --- | --- | --- |
-| 模型提前结束或“口头完成” | 确定性规则 + LLM Reviewer 的 Stop Hook 双层校验 | 最终回答必须有文件、命令或测试证据支撑 |
-| Agent 重复调用工具并原地循环 | 对工具名和标准化 JSON 参数生成调用指纹，连续重复时跳过执行并注入纠偏反馈 | 避免无效调用消耗轮次与 Token |
-| 长任务上下文持续膨胀 | Token 感知的两级压缩，优先精简历史 Tool Result，再生成结构化任务摘要 | 保留目标、修改和验证证据，同时控制上下文成本 |
-| 用户或多个 Agent 并发修改文件 | SHA-256 文件版本校验 + 临时文件原子替换 + Snapshot 恢复 | 以类似乐观锁的方式避免旧内容覆盖新修改 |
-| 模型不了解陌生代码仓库 | Repo Map + 符号索引 + ripgrep + ContextLedger 的分层代码导航 | 逐步缩小范围，以工作区实时源码作为最终事实 |
-| 复杂任务难以稳定执行 | Plan/Team 共用 DAG 编排内核、全局预算、任务状态与 checkpoint | 支持依赖调度、并行只读任务、审查重试与中断续跑 |
-| 审批、审计和异常处理耦合在执行器中 | 可插拔 Pre Tool、Post Tool、Error Hook 生命周期管线 | 不修改执行主流程即可扩展 HITL、审计和结果加工 |
-| 外部工具接入方式不统一 | MCP Client/Server，支持 stdio 与 Streamable HTTP、能力发现、分页和会话复用 | 外部 Tool、Resource、Prompt 可以动态注册到 Agent |
-| 专项工作流全部塞入 System Prompt | Skill 懒加载、激活屏障、依赖检查与资源按需读取 | 降低常驻上下文，让专项能力独立扩展 |
 
 ## 系统架构
 
@@ -61,7 +27,7 @@ flowchart LR
 
 ![SmartCLI 终端运行效果](docs/images/smartcli-terminal-demo.png)
 
-## 功能全景
+## 功能特性
 
 - 交互式终端 Agent，基于 Rich 和 prompt-toolkit 渲染
 - 单次 prompt 模式，适合脚本、管道和自动化调用
